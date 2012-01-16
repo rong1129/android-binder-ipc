@@ -1,0 +1,47 @@
+!!! Tested only on x86 32bit only (for now) - I'm using Ubuntu 10.04
+
+To Build:
+
+1. Build binder module
+	cd module; make
+	* see gen_deps.sh/deps.c for how missing symbols are created 
+
+2. Build service manager
+	cd servicemanager; make
+
+3. Build binder library
+	cd libs; make
+
+4. Build the test program
+	cd test; make
+
+
+To Test (run as root for now)
+1. Load driver
+	cd moudle; insmod binder_x86.ko
+
+2. Start service manager
+	cd servicemanager; ./servicemanager &
+
+3. Run the test program 
+	cd test;
+	./binderAddInts -n 10000
+
+serverCPU:  unbound
+clientCPU:  unbound
+iterations: 10000
+iterDelay: 0.001
+Time per iteration min: 0.000151486 avg: 0.000181443 max: 0.00497661
+
+	./binderAddInts -n 10000 -d 0
+
+serverCPU:  unbound
+clientCPU:  unbound
+iterations: 10000
+iterDelay: 0
+Time per iteration min: 0.000139962 avg: 0.000258004 max: 0.00490384
+
+
+Problems:
+1. Compare the results above: one with delay between iteration and the one without, you will see the average iteration delay is much longer for the one without delay. 
+* It's most likely due to inefficient locking in the binder driver, i.e. global binder_lock. So I guess it's step one for this project to address.
