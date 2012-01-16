@@ -13,6 +13,6 @@ deps.h: gen_deps.sh
 	./gen_deps.sh
 	
 clean:
-	rm -f deps.h *.o *.ko *.mod.c *.symvers *.order
+	rm -rf deps.h *.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions
 
 endif

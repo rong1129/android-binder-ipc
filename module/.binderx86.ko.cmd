@@ -1,1 +1,0 @@
-cmd_/disk2/home/rong/Work/android-binder-ipc/module/binderx86.ko := ld -r -m elf_i386 -T /home/rong/Work/sched/linux-3.1.6/scripts/module-common.lds --build-id  -o /disk2/home/rong/Work/android-binder-ipc/module/binderx86.ko /disk2/home/rong/Work/android-binder-ipc/module/binderx86.o /disk2/home/rong/Work/android-binder-ipc/module/binderx86.mod.o
