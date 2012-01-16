@@ -43,5 +43,5 @@ Time per iteration min: 0.000139962 avg: 0.000258004 max: 0.00490384
 
 
 Problems:
-1. Compare the results above: one with delay between iteration and the one without, you will see the average iteration delay is much longer for the one without delay. 
+1. Compare the results above: one with delay between iterations and the other one without, you see the average iteration delay is much longer for the one without delay. 
 * It's most likely due to inefficient locking in the binder driver, i.e. global binder_lock. So I guess it's step one for this project to address.
