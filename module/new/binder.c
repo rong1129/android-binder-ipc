@@ -36,7 +36,6 @@
 #define MAX_TRANSACTION_SIZE			4000
 #define OBJ_ID_INIT(owner, binder)		{ (owner), (binder) }
 #define MSG_BUF_ALIGN(n)			ALIGN((n), sizeof(void *))
-#define MSG_BUF_SIZE(ds, os)			(MSG_BUF_ALIGN(ds) + MSG_BUF_ALIGN(os))
 
 
 enum {	// compat: review looper idea
@@ -95,7 +94,7 @@ struct binder_notifier {
 
 struct binder_obj {
 	obj_id_t obj_id;
-	void *real_cookie;
+	void *real_cookie;		// named differently to be less confusing
 
 	struct rb_node rb_node;
 
@@ -112,11 +111,10 @@ struct bcmd_notifier_data {
 
 struct bcmd_msg_buf {
 	void *data;
-	size_t data_size;
-
 	void *offsets;
-	size_t offsets_size;
 
+	size_t data_size;
+	size_t offsets_size;
 	size_t buf_size;
 };
 
@@ -127,12 +125,13 @@ struct bcmd_msg {
 	unsigned int type;		// compat: review all data types in/out of the ioctl
 	unsigned int code;
 	unsigned int flags;
+	void *cookie;
+
 	struct bcmd_msg_buf *buf;
 
 	pid_t sender_pid;
 	uid_t sender_euid;
 
-	void *cookie;
 	struct msg_queue *reply_queue;
 };
 
@@ -156,8 +155,8 @@ static inline int obj_id_cmp(obj_id_t *a, obj_id_t *b)
 
 	if ((sign = a->binder - b->binder))
 		return (sign > 0) ? 1 : -1;
-	else
-		return 0;
+
+	return 0;
 }
 
 static struct binder_obj *_binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
@@ -238,16 +237,15 @@ static struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder)
 	return _binder_new_obj(proc, proc->queue, binder);
 }
 
-
 // used by the queue owner
 static inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
 {
-	struct list_head *plist = &(*pmsg)->list;
+	struct list_head *list = &(*pmsg)->list;
 	int r;
 
-	r = read_msg_queue(q, &plist);
+	r = read_msg_queue(q, &list);
 	if (!r)
-		*pmsg = container_of(plist, struct bcmd_msg, list);
+		*pmsg = container_of(list, struct bcmd_msg, list);
 	return r;
 }
 
@@ -325,14 +323,17 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	struct bcmd_msg *msg;
 	struct bcmd_msg_buf *buf;
 
-	msg_size = MSG_BUF_ALIGN(sizeof(*msg));
-	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
+	msg_size = MSG_BUF_ALIGN(sizeof(*msg)) + MSG_BUF_ALIGN(sizeof(*buf));
+	buf_size = MSG_BUF_ALIGN(data_size) + MSG_BUF_ALIGN(offsets_size);
 
 	msg = kmalloc(msg_size + buf_size, GFP_KERNEL);
 	if (!msg)
 		return NULL;
 
-	buf = (struct bcmd_msg_buf *)((void *)msg + msg_size);
+	buf = (struct bcmd_msg_buf *)((void *)msg + MSG_BUF_ALIGN(sizeof(*msg)));
+	buf->data = (void *)msg + msg_size;
+	buf->offsets = (void *)msg + msg_size + MSG_BUF_ALIGN(data_size);
+
 	buf->data_size = data_size;
 	buf->offsets_size = offsets_size;
 	buf->buf_size = buf_size;
@@ -346,8 +347,10 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	size_t buf_size;
 	struct bcmd_msg_buf *buf = msg->buf;
 
-	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
+	buf_size = MSG_BUF_ALIGN(data_size) + MSG_BUF_ALIGN(offsets_size);
 	if (buf->buf_size >= buf_size) {
+		buf->offsets = (void *)buf->data + MSG_BUF_ALIGN(data_size);
+
 		buf->data_size = data_size;
 		buf->offsets_size = offsets_size;
 		return msg;
@@ -526,7 +529,9 @@ static int binder_free_proc(struct binder_proc *proc)
 
 	while ((n = rb_first(&proc->thread_tree))) {
 		thread = rb_entry(n, struct binder_thread, rb_node);
-		binder_free_thread(proc, thread);
+		r = binder_free_thread(proc, thread);
+		if (r < 0)
+			return r;
 	}
 
 	spin_lock(&proc->lock);
@@ -1179,7 +1184,6 @@ static inline int cmd_set_context_mgr(struct binder_proc *proc)
 	else if (context_mgr_uid != current->cred->euid)
 		return -EPERM;
 
-	// TODO: protection
 	context_mgr_obj = binder_new_obj(proc, NULL);
 	if (!context_mgr_obj)
 		return -ENOMEM;
@@ -1275,6 +1279,14 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static unsigned int binder_poll(struct file *filp, struct poll_table_struct *wait)
 {
+	struct binder_proc *proc = filp->private_data;
+	struct binder_thread *thread;
+
+	thread = binder_get_thread(proc, filp);
+	if (!thread)
+		return -ENOMEM;
+
+
 	return 0;
 }
 

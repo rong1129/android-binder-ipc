@@ -69,7 +69,7 @@ struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler)
 	if (!q)
 		return NULL;
 
-	q->max_msgs = max_msgs ? max_msgs : DEFAULT_MAX_QUEUE_LENGTH;
+	q->max_msgs = (max_msgs > 0) ? max_msgs : DEFAULT_MAX_QUEUE_LENGTH;
 	q->num_msgs = 0;
 
 	spin_lock_init(&q->lock);
@@ -98,7 +98,7 @@ int get_msg_queue(struct msg_queue *q)
 	spin_lock(&g_queue_lock);
 	if (!rb_queue_exist(q)) {
 		spin_unlock(&g_queue_lock);
-		return -EFAULT;
+		return -ENODEV;
 	}
 
 	q->usage++;
@@ -136,16 +136,15 @@ int put_msg_queue(struct msg_queue *q)
 
 static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head)
 {
-	int retval;
 	DECLARE_WAITQUEUE(wait, current);
+	int r;
 
 	add_wait_queue(&q->wr_wait, &wait);
-
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		if (!q->active) {
-			retval = -EIO;
+			r = -EIO;
 			break;
 		}
 
@@ -159,13 +158,13 @@ static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head
 			spin_unlock(&q->lock);
 
 			wake_up(&q->rd_wait);
-			retval = 0;
+			r = 0;
 			break;
 		}
 		spin_unlock(&q->lock);
 
 		if (signal_pending(current)) {
-			retval = -ERESTARTSYS;
+			r = -ERESTARTSYS;
 			break;
 		}
 		schedule();
@@ -174,7 +173,7 @@ static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head
 	__set_current_state(TASK_RUNNING);
 	remove_wait_queue(&q->wr_wait, &wait);
 
-	return retval;
+	return r;
 }
 
 int write_msg_queue(struct msg_queue *q, struct list_head *msg)
@@ -189,17 +188,16 @@ int write_msg_queue_head(struct msg_queue *q, struct list_head *msg)
 
 static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tail)
 {
-	int retval;
 	struct list_head *entry;
 	DECLARE_WAITQUEUE(wait, current);
+	int r;
 
 	add_wait_queue(&q->rd_wait, &wait);
-
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		if (!q->active) {
-			retval = -EIO;
+			r = -EIO;
 			break;
 		}
 
@@ -217,13 +215,13 @@ static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tai
 			*pmsg = entry;
 
 			wake_up(&q->wr_wait);
-			retval = 0;
+			r = 0;
 			break;
 		}
 		spin_unlock(&q->lock);
 
 		if (signal_pending(current)) {
-			retval = -ERESTARTSYS;
+			r = -ERESTARTSYS;
 			break;
 		}
 		schedule();
@@ -232,7 +230,7 @@ static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tai
 	__set_current_state(TASK_RUNNING);
 	remove_wait_queue(&q->rd_wait, &wait);
 
-	return retval;
+	return r;
 }
 
 int read_msg_queue(struct msg_queue *q, struct list_head **pmsg)
