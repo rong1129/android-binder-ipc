@@ -160,6 +160,111 @@ static inline int obj_id_cmp(obj_id_t *a, obj_id_t *b)
 		return 0;
 }
 
+static struct binder_obj *_binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
+{
+	struct rb_node **p = &proc->obj_tree.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_obj *obj;
+	obj_id_t obj_id = OBJ_ID_INIT(owner, binder);
+	int r;
+
+	spin_lock(&proc->obj_lock);
+	while (*p) {
+		parent = *p;
+		obj = rb_entry(parent, struct binder_obj, rb_node);
+
+		r = obj_id_cmp(&obj_id, &obj->obj_id);
+		if (r < 0)
+			p = &(*p)->rb_left;
+		else if (r > 0)
+			p = &(*p)->rb_right;
+		else {
+			spin_unlock(&proc->obj_lock);
+			return obj;
+		}
+	}
+	spin_unlock(&proc->obj_lock);
+
+	return NULL;
+}
+
+static struct binder_obj *binder_find_obj(struct binder_proc *proc, void *binder)
+{
+	return _binder_find_obj(proc, proc->queue, binder);
+}
+
+static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner, void *binder)
+{
+	struct rb_node **p = &proc->obj_tree.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_obj *obj, *new_obj;
+	obj_id_t obj_id = OBJ_ID_INIT(owner, binder);
+	int r;
+
+	new_obj = kmalloc(sizeof(*obj), GFP_KERNEL);
+	if (!new_obj)
+		return NULL;
+	new_obj->obj_id = obj_id;
+	spin_lock_init(&new_obj->lock);
+	INIT_LIST_HEAD(&new_obj->notifiers);
+
+	spin_lock(&proc->obj_lock);
+	while (*p) {
+		parent = *p;
+		obj = rb_entry(parent, struct binder_obj, rb_node);
+
+		r = obj_id_cmp(&obj_id, &obj->obj_id);
+		if (r < 0)
+			p = &(*p)->rb_left;
+		else if (r > 0)
+			p = &(*p)->rb_right;
+		else {	// other thread has created an object before we do
+			spin_unlock(&proc->obj_lock);
+			kfree(new_obj);
+			return obj;
+		}
+	}
+
+	rb_link_node(&new_obj->rb_node, parent, p);
+	rb_insert_color(&new_obj->rb_node, &proc->obj_tree);
+
+	spin_unlock(&proc->obj_lock);
+
+	return new_obj;
+}
+
+static struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder)
+{
+	return _binder_new_obj(proc, proc->queue, binder);
+}
+
+
+// used by the queue owner
+static inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
+{
+	struct list_head *plist = &(*pmsg)->list;
+	int r;
+
+	r = read_msg_queue(q, &plist);
+	if (!r)
+		*pmsg = container_of(plist, struct bcmd_msg, list);
+	return r;
+}
+
+// used by any process
+static inline int bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
+{
+	int r;
+
+	if (get_msg_queue(q) < 0)
+		return -EFAULT;
+
+	r = _bcmd_read_msg(q, pmsg);
+
+	put_msg_queue(q);
+	return r;
+}
+
 // used by the queue owner
 static inline int _bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 {
@@ -212,6 +317,44 @@ static inline size_t bcmd_msg_queue_size(struct msg_queue *q)
 
 	put_msg_queue(q);
 	return size;
+}
+
+static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
+{
+	size_t msg_size, buf_size;
+	struct bcmd_msg *msg;
+	struct bcmd_msg_buf *buf;
+
+	msg_size = MSG_BUF_ALIGN(sizeof(*msg));
+	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
+
+	msg = kmalloc(msg_size + buf_size, GFP_KERNEL);
+	if (!msg)
+		return NULL;
+
+	buf = (struct bcmd_msg_buf *)((void *)msg + msg_size);
+	buf->data_size = data_size;
+	buf->offsets_size = offsets_size;
+	buf->buf_size = buf_size;
+
+	msg->buf = buf;
+	return msg;
+}
+
+static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_size, size_t offsets_size)
+{
+	size_t buf_size;
+	struct bcmd_msg_buf *buf = msg->buf;
+
+	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
+	if (buf->buf_size >= buf_size) {
+		buf->data_size = data_size;
+		buf->offsets_size = offsets_size;
+		return msg;
+	}
+
+	kfree(msg);
+	return binder_alloc_msg(data_size, offsets_size);
 }
 
 static void free_queued_msg(struct list_head *entry)
@@ -339,11 +482,45 @@ static int binder_free_thread(struct binder_proc *proc, struct binder_thread *th
 	return 0;
 }
 
+static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
+{
+	if (obj->obj_id.owner == proc->queue) {
+		struct binder_notifier *notifier, *next;
+		struct bcmd_msg *msg = NULL;
+
+		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
+			list_del(&notifier->list);
+
+			if (!msg) {
+				msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: ugly
+				if (!msg) {
+					kfree(obj);
+					return -ENOMEM;
+				}
+			}
+
+			msg->type = BR_DEAD_BINDER;
+			msg->obj_id = obj->obj_id;
+			msg->cookie = notifier->cookie;
+			if (!bcmd_write_msg(notifier->notify_queue, msg))
+				msg = NULL;
+		}
+		if (msg)
+			kfree(msg);
+	} else {	// just reference
+		BUG_ON(!list_empty(&obj->notifiers));
+	}
+
+	kfree(obj);
+	return 0;
+}
+
 static int binder_free_proc(struct binder_proc *proc)
 {
 	struct rb_node *n;
 	struct binder_thread *thread;
 	struct binder_obj *obj;
+	int r;
 
 	free_msg_queue(proc->queue);
 
@@ -358,152 +535,14 @@ static int binder_free_proc(struct binder_proc *proc)
 
 		rb_erase(n, &proc->obj_tree);
 
-		if (obj->obj_id.owner != proc->queue) {	// just reference
-			BUG_ON(!list_empty(&obj->notifiers));
-			kfree(obj);
-		} else {
-			struct binder_notifier *notifier, *next;
-			struct bcmd_msg *msg = NULL;
-
-			list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
-				list_del(&notifier->list);
-
-				if (!msg) {
-					msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: ugly
-					if (!msg)
-						return -ENOMEM;
-				}
-
-				msg->type = BR_DEAD_BINDER;
-				msg->obj_id = obj->obj_id;
-				msg->cookie = notifier->cookie;
-				if (!bcmd_write_msg(notifier->notify_queue, msg))
-					msg = NULL;
-			}
-			if (msg)
-				kfree(msg);
-		}
+		r = binder_free_obj(proc, obj);
+		if (r < 0)
+			return r;
 	}
 	spin_unlock(&proc->lock);
 
 	kfree(proc);
 	return 0;
-}
-
-static struct binder_obj *_binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
-{
-	struct rb_node **p = &proc->obj_tree.rb_node;
-	struct rb_node *parent = NULL;
-	struct binder_obj *obj;
-	obj_id_t obj_id = OBJ_ID_INIT(owner, binder);
-	int r;
-
-	spin_lock(&proc->obj_lock);
-	while (*p) {
-		parent = *p;
-		obj = rb_entry(parent, struct binder_obj, rb_node);
-
-		r = obj_id_cmp(&obj_id, &obj->obj_id);
-		if (r < 0)
-			p = &(*p)->rb_left;
-		else if (r > 0)
-			p = &(*p)->rb_right;
-		else {
-			spin_unlock(&proc->obj_lock);
-			return obj;
-		}
-	}
-	spin_unlock(&proc->obj_lock);
-
-	return NULL;
-}
-
-static struct binder_obj *binder_find_obj(struct binder_proc *proc, void *binder)
-{
-	return _binder_find_obj(proc, proc->queue, binder);
-}
-
-static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner, void *binder)
-{
-	struct rb_node **p = &proc->obj_tree.rb_node;
-	struct rb_node *parent = NULL;
-	struct binder_obj *obj, *new_obj;
-	obj_id_t obj_id = OBJ_ID_INIT(owner, binder);
-	int r;
-
-	new_obj = kmalloc(sizeof(*obj), GFP_KERNEL);
-	if (!new_obj)
-		return NULL;
-	new_obj->obj_id = obj_id;
-	spin_lock_init(&new_obj->lock);
-	INIT_LIST_HEAD(&new_obj->notifiers);
-
-	spin_lock(&proc->obj_lock);
-	while (*p) {
-		parent = *p;
-		obj = rb_entry(parent, struct binder_obj, rb_node);
-
-		r = obj_id_cmp(&obj_id, &obj->obj_id);
-		if (r < 0)
-			p = &(*p)->rb_left;
-		else if (r > 0)
-			p = &(*p)->rb_right;
-		else {	// other thread has created an object before we do
-			spin_unlock(&proc->obj_lock);
-			kfree(new_obj);
-			return obj;
-		}
-	}
-
-	rb_link_node(&new_obj->rb_node, parent, p);
-	rb_insert_color(&new_obj->rb_node, &proc->obj_tree);
-
-	spin_unlock(&proc->obj_lock);
-
-	return new_obj;
-}
-
-static struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder)
-{
-	return _binder_new_obj(proc, proc->queue, binder);
-}
-
-static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
-{
-	size_t msg_size, buf_size;
-	struct bcmd_msg *msg;
-	struct bcmd_msg_buf *buf;
-
-	msg_size = MSG_BUF_ALIGN(sizeof(*msg));
-	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
-
-	msg = kmalloc(msg_size + buf_size, GFP_KERNEL);
-	if (!msg)
-		return NULL;
-
-	buf = (struct bcmd_msg_buf *)((void *)msg + msg_size);
-	buf->data_size = data_size;
-	buf->offsets_size = offsets_size;
-	buf->buf_size = buf_size;
-
-	msg->buf = buf;
-	return msg;
-}
-
-static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_size, size_t offsets_size)
-{
-	size_t buf_size;
-	struct bcmd_msg_buf *buf = msg->buf;
-
-	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
-	if (buf->buf_size >= buf_size) {
-		buf->data_size = data_size;
-		buf->offsets_size = offsets_size;
-		return msg;
-	}
-
-	kfree(msg);
-	return binder_alloc_msg(data_size, offsets_size);
 }
 
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp)
@@ -607,33 +646,6 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 
 	return 0;
 }
-
-// used by the queue owner
-static inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
-{
-	struct list_head *plist = &(*pmsg)->list;
-	int r;
-
-	r = read_msg_queue(q, &plist);
-	if (!r)
-		*pmsg = container_of(plist, struct bcmd_msg, list);
-	return r;
-}
-
-// used by any process
-static inline int bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
-{
-	int r;
-
-	if (get_msg_queue(q) < 0)
-		return -EFAULT;
-
-	r = _bcmd_read_msg(q, pmsg);
-
-	put_msg_queue(q);
-	return r;
-}
-
 
 static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_transaction_data *tdata, uint32_t bcmd)
 {
@@ -872,13 +884,18 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				err += bcmd_write_looper(proc, thread, bcmd);
 				break;
 
+			case BC_DEAD_BINDER_DONE:
+				// TODO: do something?
+				p += sizeof(void *);
+				break;
+				
 			default:
 				return -EINVAL;
 		}
 	}
 
-	if (err) {	// flag the event, so next binder_thread_read would pick it up
-	}
+	if (err)	// not compat: original binder would stop
+		thread->last_error = BR_ERROR;
 
 	return p - buf;
 }
@@ -1043,10 +1060,19 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 
 static long binder_thread_read(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
 {
-	struct bcmd_msg *msg;
+	struct bcmd_msg *msg = NULL;
 	struct msg_queue *q;
 	void __user *p = buf;
 	long n;
+
+	if (thread->last_error) {
+		if (size >= sizeof(uint32_t)) {
+			if (put_user(thread->last_error, (uint32_t *)p))
+				return -EFAULT;
+			thread->last_error = 0;
+			p += sizeof(uint32_t);
+		}
+	}
 
 	n = bcmd_spawn_on_busy(proc, p, size);	// TODO: find a more suitable place
 	if (n > 0) {
@@ -1180,7 +1206,11 @@ static int binder_release(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc = filp->private_data;
 
+	if (context_mgr_obj && context_mgr_obj->obj_id.owner == proc->queue) 
+		context_mgr_obj = NULL;
+
 	// TODO: assume no more threads running
+	// TODO: make sure existing referencing context_mgr_obj is safe
 	binder_free_proc(proc);
 	return 0;
 }
@@ -1286,8 +1316,9 @@ static int __init binder_init(void)
 
 static void __exit binder_exit(void)
 {
+	misc_deregister(&binder_miscdev);
 }
 
 module_init(binder_init);
-//module_exit(binder_exit);
+module_exit(binder_exit);
 MODULE_LICENSE("GPL v2");
