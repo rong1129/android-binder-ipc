@@ -29,9 +29,17 @@
 
 
 #define MAX_TRANSACTION_SIZE			4000
-#define TRANSACTION_HASH_BUCKET_SIZE		16
-
 #define OBJ_ID_INIT(owner, binder)		{ (owner), (binder) }
+#define MSG_BUF_ALIGN(n)			ALIGN((n), sizeof(void *))
+#define MSG_BUF_SIZE(ds, os)			(MSG_BUF_ALIGN(ds) + MSG_BUF_ALIGN(os))
+
+
+enum {	// compat: review looper idea
+	BINDER_LOOPER_STATE_INVALID     = 0x00,
+	BINDER_LOOPER_STATE_REGISTERED  = 0x01,
+	BINDER_LOOPER_STATE_ENTERED     = 0x02,
+	BINDER_LOOPER_STATE_READY       = 0x03
+};
 
 
 typedef struct obj_id {
@@ -53,10 +61,11 @@ struct binder_proc {
 
 	struct msg_queue *queue;
 
+	pid_t pid;
 	int non_block;
 
-	pid_t pid;
 	int max_threads;
+	int num_loopers, pending_loopers;
 };
 
 struct binder_thread {
@@ -65,10 +74,11 @@ struct binder_thread {
 	struct rb_node rb_node;
 	struct msg_queue *queue;
 
+	int state;
 	int non_block;
 
-	unsigned int num_pending;
-	struct list_head pending_transactions[TRANSACTION_HASH_BUCKET_SIZE];
+	unsigned int pending_replies;
+	struct list_head incoming_transactions;
 };
 
 struct binder_notifier {
@@ -84,14 +94,14 @@ struct binder_obj {
 
 	struct rb_node rb_node;
 
-	spin_lock_t lock;	// used for notifiers only
+	spin_lock_t lock;		// used for notifiers only
 	struct list_head notifiers;	// TODO: slow deletion
 };
 
-#define bcmd_data_transaction	binder_transaction_data
+#define bcmd_transaction_data	binder_transaction_data
 
-struct bcmd_data_notifier {
-	void *handle;
+struct bcmd_notifier_data {
+	void *binder;
 	void *cookie;
 };
 
@@ -101,14 +111,16 @@ struct bcmd_msg_buf {
 
 	void *offsets;
 	size_t offsets_size;
+
+	size_t buf_size;
 }
 
 struct bcmd_msg {
-	struct list_head __list;	// has to be the first field so we can cast it around
+	struct list_head list;		// has to be the first field so we can cast it around
 
 	obj_id_t obj_id;
-	unsigned int type;
-	unsigned int code;
+	unsigned int type;		// compat: review all data types in/out of the ioctl
+	unsigned int code;		// compat
 	struct bcmd_msg_buf *buf;
 
 	pid_t sender_pid;
@@ -119,8 +131,8 @@ struct bcmd_msg {
 };
 
 
-static obj_t *context_mgr_obj;
-static uid_t context_mgr_uid;		// compat
+static obj_t *context_mgr_obj;		// compat: is context mgr necessary?
+static uid_t context_mgr_uid = -1;
 
 
 static inline void obj_id_init(obj_it_t *obj_id, struct binder_proc *proc, void *binder)
@@ -158,7 +170,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	}
 
 	proc->pid = task_tgid_vnr(current);
-	proc->max_threads = 0;
+	proc->max_threads = proc->num_loopers = proc->pending_loopers = 0;
 
 	spin_lock_init(&proc->lock);
 	proc->thread_tree.rb_node = NULL;
@@ -179,7 +191,7 @@ static int binder_free_proc(struct binder_proc *proc)
 		obj = rb_entry(n, struct binder_obj, rb_node);
 	
 		rb_erase(n, &proc->obj_tree);
-		if (obj->obj_id.owner != proc->queue) {	// references
+		if (obj->obj_id.owner != proc->queue) {	// just reference
 			BUG_ON(!list_empty(&obj->notifiers));
 			kfree(obj);
 		} else {
@@ -190,12 +202,12 @@ static int binder_free_proc(struct binder_proc *proc)
 				list_del(&notifier->list);
 
 				if (!msg) {
-					msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: nasty
+					msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: ugly
 					if (!msg)
 						return -ENOMEM;
 				}
 
-				msg->type = BR_DEAD_BINDER;
+				msg->type = BC_DEAD_BINDER;
 				msg->obj_id = obj->obj_id;
 				msg->cookie = notifier->cookie;
 				if (!bcmd_write_msg(notifier->notify_queue, msg))
@@ -215,7 +227,6 @@ static int binder_free_proc(struct binder_proc *proc)
 static struct binder_thread *binder_new_thread(struct file *filp, pid_t pid)
 {	
 	struct binder_thread *thread;
-	int i;
 
 	thread = kmalloc(sizeof(*thread), GFP_KERNEL);
 	if (!thread)
@@ -229,10 +240,8 @@ static struct binder_thread *binder_new_thread(struct file *filp, pid_t pid)
 	}
 
 	thread->pid = pid;
-
-	thread->num_pending = 0;
-	for (i = 0; i < sizeof(thread->pending_transactions) / sizeof(thread->pending_transactions[0]); i++)
-		INIT_LIST_HEAD(&thread->pending_transactions[i]);
+	thread->pending_replies = 0;
+	INIT_LIST_HEAD(&thread->incoming_transactions);
 
 	return thread;
 }
@@ -270,6 +279,18 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc, struct 
 	spin_unlock(&proc->lock);
 
 	return thread;
+}
+
+static struct binder_thread *binder_free_thread(struct binder_proc *proc, struct binder_thread *thread)
+{
+	spin_lock(&proc->lock);
+	rb_erase(&thread->rb_node, &proc->thread_tree);
+	spin_unlock(&proc->lock);
+
+	free_msg_queue(thread->queue);
+
+	// failed reply
+	kfree(thread);
 }
 
 static struct binder_obj *_binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
@@ -356,8 +377,8 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	struct bcmd_msg_buf *buf;
 	void *p;
 
-	msg_size = ALIGN(sizeof(*msg), sizeof(void *));
-	buf_size = ALIGN(data_size, sizeof(void *)) + ALIGN(offsets_size, sizeof(void *));
+	msg_size = MSG_BUF_ALIGN(sizeof(*msg));
+	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
 
 	msg = kmalloc(msg_size + buf_size, GFP_KERNEL);
 	if (!p)
@@ -366,9 +387,26 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	buf = (struct bcmd_msg_buf *)((void *)msg + msg_size);
 	buf->data_size = data_size;
 	buf->offsets_size = offsets_size;
+	buf->buf_size = buf_size;
 
 	msg->buf = buf;
 	return msg;
+}
+
+static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_size, size_t offsets_size)
+{
+	size_t buf_size;
+	struct bcmd_msg_buf *buf = msg->buf;
+
+	buf_size = MSG_BUF_SIZE(data_size, offsets_size);
+	if (buf->buf_size >= buf_size) {
+		buf->data_size = data_size;
+		buf->offsets_size = offsets_size;
+		return msg;
+	}
+
+	kfree(msg);
+	return binder_alloc_msg(data_size, offsets_size);
 }
 
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp)
@@ -448,7 +486,7 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 	return 0;
 }
 
-static int bcmd_init_msg_buf(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg_buf *buf, struct bcmd_data_transaction *tdata)
+static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg_buf *buf, struct bcmd_transaction_data *tdata)
 {
 	size_t *p = buf->offsets, *ep = buf->offsets + buf->offsets_size;
 	struct flat_binder_object *bp;
@@ -473,6 +511,33 @@ static int bcmd_init_msg_buf(struct binder_proc *proc, struct binder_thread *thr
 	return 0;
 }
 
+// used by the queue owner
+static inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
+{
+	return read_msg_queue(q, (struct list_head **)pmsg);
+}
+
+// used by any process
+static inline int bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
+{
+	int r;
+
+	if (get_msg_queue(q) < 0)
+		return -EFAULT;
+
+	r = _bcmd_read_msg(q, pmsg);
+
+	put_msg_queue(q);
+	return r;
+}
+
+// used by the queue owner
+static inline int _bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
+{
+	return write_msg_queue(q, (struct list_head *)msg);
+}
+
+// used by any process
 static inline int bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 {
 	int r;
@@ -480,36 +545,92 @@ static inline int bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 	if (get_msg_queue(q) < 0)
 		return -EFAULT;
 
-	r = write_msg_queue(q, (struct list_head *)msg);
+	r = _bcmd_write_msg(q, msg);
 
 	put_msg_queue(q);
 	return r;
 }
 
-static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_data_transaction *tdata)
+// used by the queue owner
+static inline int _bcmd_write_msg_head(struct msg_queue *q, struct bcmd_msg *msg)
 {
-	struct binder_obj *obj;
+	return write_msg_queue_head(q, (struct list_head *)msg);
+}
+
+// used by any process
+static inline int bcmd_write_msg_head(struct msg_queue *q, struct bcmd_msg *msg)
+{
+	int r;
+
+	if (get_msg_queue(q) < 0)
+		return -EFAULT;
+
+	r = _bcmd_write_msg_head(q, msg);
+
+	put_msg_queue(q);
+	return r;
+}
+
+// used by any process
+static inline size_t bcmd_msg_queue_size(struct msg_queue *q)
+{	
+	size_t size;
+
+	if (get_msg_queue(q) < 0)
+		return -EFAULT;
+
+	size = msg_queue_size(q);
+
+	put_msg_queue(q);
+	return size;
+}
+
+static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_transaction_data *tdata, uint32_t bcmd)
+{
 	struct bcmd_msg *msg;
+	struct msg_queue *q;
 	uint32_t err;
-	void *binder = (void *)tdata->target.handle;
 
-	if (unlikely(!binder))
-		obj = context_mgr_obj;
-	else
-		obj = binder_find_obj(proc, binder);
-	if (!obj) {
-		err = BR_FAILED_REPLY;
-		goto failed_obj;
+	if (bcmd == BC_TRANSACTION) {
+		struct binder_obj *obj;
+		void *binder = (void *)tdata->target.handle;
+
+		if (unlikely(!binder))
+			obj = context_mgr_obj;
+		else
+			obj = binder_find_obj(proc, binder);
+		if (!obj) {
+			err = BR_FAILED_REPLY;
+			goto failed_obj;
+		}
+
+		q = obj->obj_id.owner;
+
+		msg = binder_alloc_msg(tdata->data_size, tdata->offsets_size);
+		if (!msg) {
+			err = BR_FAILED_REPLY;
+			goto failed_msg;
+		}
+		msg->obj_id = obj->obj_id;
+	} else {
+		// compat: pop out the top transaction without checking
+		if (list_empty(&thread->incoming_transactions)) {
+			err = BR_FAILED_REPLY;
+			goto failed_transaction;
+		}
+		msg = list_first_entry(&thread->incoming_transactions, struct bcmd_msg, list);
+		list_del(&msg->list);
+
+		q = msg->reply_queue;
+		msg = binder_realloc_msg(msg, tdata->data_size, tdata->offsets_size);
+		if (!msg) {
+			err = BR_FAILED_REPLY;
+			goto failed_msg;
+		}
+		obj_id_init(&msg->obj_id, NULL, NULL);	// compat
 	}
 
-	msg = binder_alloc_msg(tdata->data_size, tdata->offsets_size);
-	if (!msg) {
-		err = BR_FAILED_REPLY;
-		goto failed_msg;
-	}
-
-	msg->type = BC_TRANSACTION;
-	msg->obj_id = obj->obj_id;
+	msg->type = bcmd;
 	msg->code = tdata->code;
 	msg->flags = tdata->flags;
 	msg->sender_pid = proc->pid;
@@ -517,19 +638,35 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	msg->reply_queue = (tdata->flags & TF_ONE_WAY) ? NULL : thread->queue; 
 
 	if (tdata->data_size > 0) {
-		if (!bcmd_init_msg_buf(proc, thread, msg->buf, tdata)) {
+		if (!bcmd_write_msg_buf(proc, thread, msg->buf, tdata)) {
 			err = BR_FAILED_REPLY;
 			goto failed_load;
 		}
 	}
 
-	if (bcmd_write_msg(obj->obj_id.owner, msg) < 0) {
+	if (bcmd_write_msg(q, msg) < 0) {
+		kfree(msg);
 		err = BR_DEAD_REPLY;
 		goto failed_write;
 	}
 
-	if (tdata->flags & TF_ONE_WAY) {
-		// push transaction id onto pending stack
+	if (bcmd == BC_TRANSACTION && !(tdata->flags & TF_ONE_WAY))
+		thread->pending_replies++;
+
+	// compat: Write TR-COMPLETE message back to the caller as per the protocol
+	msg = binder_alloc_msg(0, 0);
+	if (!msg) {
+		err = BR_FAILED_REPLY;
+		goto failed_complete;
+	}
+	msg->type = BR_TRANSACTION_COMPLETE;
+	msg->obj_id = obj->obj_id;
+	msg->code = tdata->code;
+	msg->flags = tdata->flags;
+	if (_bcmd_write_msg(thread->queue, msg) < 0) {
+		kfree(msg);
+		err = BR_FAILED_REPLY;
+		goto failed_complete;
 	}
 
 	return 0;
@@ -538,19 +675,20 @@ failed_write:
 failed_load:
 	kfree(msg);
 failed_msg:
+failed_transaction:
 failed_obj:
+failed_complete:
 	thread->last_error = err;
 	return -1;
 }
 
-static int bcmd_write_notifier(struct binder_proc *proc, struct bcmd_data_notifier *notifier, int msg_type)
+static int bcmd_write_notifier(struct binder_proc *proc, struct bcmd_notifier_data *notifier, uint32_t bcmd)
 {
 	struct binder_obj *obj;
 	struct bcmd_msg *msg;
 	uint32_t err;
-	void *binder = (void *)notifier->handle;
 
-	obj = binder_find_obj(proc, binder);
+	obj = binder_find_obj(proc, notifier->binder);
 	if (!obj) {
 		err = BR_FAILED_REPLY;
 		goto failed_obj;
@@ -562,7 +700,7 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct bcmd_data_notifi
 		goto failed_msg;
 	}
 
-	msg->type = msg_type;
+	msg->type = bcmd;
 	msg->obj_id = obj->obj_id;
 	msg->cookie = notifier->cookie;
 	msg->reply_queue = proc->queue;		// queue to send notification to
@@ -582,11 +720,59 @@ failed_obj:
 	return -1;
 }
 
+static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thread, uint32_t bcmd)
+{
+	int num_loopers = 0, pending_loopers = 0;
+	uint32_t err = 0;
+
+	switch (bcmd) {
+		case BC_ENTER_LOOPER:
+			if (thread->state & BINDER_LOOPER_STATE_ACTIVE)
+				err = BR_FAILED_REPLY;
+			else {
+				thread->state |= BINDER_LOOPER_STATE_ENTERED;
+				num_loopers++;
+			}
+			break;
+
+		case BC_EXIT_LOOPER:
+			if (thread->state & BINDER_LOOPER_STATE_ENTERED) {
+				thread->state &= ~BINDER_LOOPER_STATE_ACTIVE;
+				num_loopers--;
+			} else
+				err = BR_FAILED_REPLY;
+			break;
+
+		case BC_REGISTER_LOOPER:
+			if (thread->state & BINDER_LOOPER_STATE_ACTIVE)
+				err = BR_FAILED_REPLY;
+			else
+				pending_loopers--;
+			break;
+
+		default:
+			err = BR_FAILED_REPLY;
+			break;
+	}
+
+	if (err) {
+		thread->last_error = err;
+		return -1;
+	}
+
+	if (num_loopers || pending_loopers) {
+		spin_lock(&proc->lock);
+		proc->num_loopers += num_loopers;
+		proc->pending_loopers += pending_loopers;
+		spin_unlock(&proc->lock);
+	}
+	return 0;
+}
+
 static long binder_thread_write(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
 {
-	uint32_t bcmd;
 	void __user *p = buf, *ep = buf + size;
-	unsigned long pos = 0;
+	uint32_t bcmd;
 	int err = 0;
 
 	while ((p + sizeof(bcmd)) < ep) {
@@ -597,7 +783,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 		switch (bcmd) {
 			case BC_TRANSACTION:
 			case BC_REPLY:  {
-				struct bcmd_data_transaction tdata;
+				struct bcmd_transaction_data tdata;
 
 				if ((p + sizeof(tdata)) > ep || copy_from_user(&tdata, p, sizeof(tdata)))
 					return -EFAULT;
@@ -610,16 +796,13 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 						return -EINVAL;
 				}
 
-				if (bcmd == BC_TRANSACTION)
-					err += bcmd_write_transaction(proc, thread, &tdata);
-				else
-					err += bcmd_write_reply(proc, thread, &tdata);
+				err += bcmd_write_transaction(proc, thread, &tdata, bcmd);
 				break;
 			}
 
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION: {
-				struct bcmd_data_notifier notifier;
+				struct bcmd_notifier_data notifier;
 
 				if ((p + sizeof(notifier)) > ep || copy_from_user(&notifier, p, sizeof(notifier)))
 					return -EFAULT;
@@ -628,6 +811,12 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				err += bcmd_write_notifier(proc, &notifier, bcmd);
 				break;
 			}
+
+			case BC_ENTER_LOOPER:
+			case BC_EXIT_LOOPER:
+			case BC_REGISTER_LOOPER:
+				err += bcmd_write_looper(proc, thread, bcmd);
+				break;
 
 			default:
 				return -EINVAL;
@@ -640,20 +829,23 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 	return p - buf;
 }
 
-static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg *msg, void __user *buf, unsigned long size)
+static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
 {
-	struct bcmd_data_transaction tdata;
-	struct bcmd_msg_buf *mbuf;
-	unsigned long off;
+	struct bcmd_transaction_data tdata;
+	struct bcmd_msg *msg = *pmsg;
+	struct bcmd_msg_buf *mbuf = msg->buf;
+	uint32_t cmd = (msg->type == BC_TRANSACTION) ? BR_TRANSACTION : BR_REPLY;
 	void __user *data_buf;
-	size_t *p, *ep;
+	size_t data_off, data_size, *p, *ep;
 	struct flat_binder_object *bp;
+	int r;
 
-	off = ALIGN(sizeof(tdata), sizeof(void *));
-	if (off + mbuf->data_size > size)
-		return 0;
-	data_buf = buf + off;
-	
+	data_off = MSG_BUF_ALIGN(sizeof(cmd) + sizeof(tdata));
+	data_size = mbuf->data_size;
+	if (data_off + data_size > size)
+		return -ENOSPC;
+	data_buf = buf + data_off;
+
 	tdata.target.ptr = msg->obj_id.binder;
 	tdata.code = msg->code;
 	tdata.flags = msg->flags;
@@ -676,24 +868,37 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 			return r;
 	}
 
-	if (copy_to_user(buf, &tdata, sizeof(tdata)) ||
+	if (put_user(cmd, buf) ||
+	    copy_to_user(buf + sizeof(cmd), &tdata, sizeof(tdata)) ||
 	    copy_to_user(data_buf, mbuf->data, mbuf->data_size))
 		return -EFAULT;
-	
-	return (off + mbuf->data_size);
+
+	if (msg->type == BC_TRANSACTION) {
+		if (!(msg->flags & TF_ONE_WAY))
+			list_add_head(&msg->list, &thread->incoming_transactions);
+	} else {
+		if (thread->pending_replies > 0)
+			thread->pending_replies--;
+		kfree(msg);
+	}
+
+	*pmsg = NULL;
+	return (data_off + data_size);
 }
 
-static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg *msg)
+static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
 {
+	struct bcmd_msg *msg = *pmsg;
 	struct binder_notifier *notifier;
 	struct binder_obj *obj;
+	int r = 0;
 
 	obj = _binder_find_obj(proc, proc->queue, msg->obj_id.binder);
 	if (!obj)
-		return -EINVAL;
+		return -EFAULT;
 
 	if (msg->type == BC_REQUEST_DEATH_NOTIFICATION) {
-		// TODO: check previous subscrition?
+		// TODO: check duplication?
 		notifier = kmalloc(sizeof(*notifier), msg);
 		if (!notifier)
 			return -ENOMEM;
@@ -707,6 +912,9 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 	} else {
 		int found = 0;
 
+		if (size < sizeof(cmd))
+			return -ENOSPC;
+
 		spin_lock(&obj->lock);
 		list_for_each_entry_safe(notifier, &obj->notifiers, list) {
 			if (notifier->event == BINDER_EVT_OBJ_DEAD &&
@@ -719,8 +927,61 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		}
 		spin_unlock(&obj->lock);
 
-		if (found)
+		if (found) {
+			uint32_t cmd = BR_CLEAR_DEATH_NOTIFICATION_DONE;	// compat
+
 			kfree(notifier);
+			if (put_user(cmd, user))
+				return -EFAULT;
+			else
+				r = sizeof(cmd);
+		}
+	}
+
+	kfree(msg);
+	*pmsg = NULL;
+	return r;
+}
+
+static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg *msg, void __user *buf, unsigned long size)
+{
+	uint32_t cmd = BR_DEAD_BINDER;
+
+	if (size < sizeof(cmd))
+		return -ENOSPC;
+
+	if (put_user(cmd, user))
+		return -EFAULT;
+
+	kfree(msg);
+	*pmsg = NULL;
+	return sizeof(cmd);
+}
+
+static int bcmd_spawn_on_busy(proc, void __user *buf, unsigned long size)
+{
+	uint32_t cmd = BR_SPAWN_LOOPER;
+	size_t n;
+
+	if (size < sizeof(cmd))
+		return 0;
+
+	n = bcmd_msg_queue_size(proc->queue);
+	if (n < 0)
+		return n;
+
+	if (n > 1) {
+		spin_lock(&proc->lock);
+		if (proc->num_loopers + proc->pending_loopers < proc->max_threads) {
+			if (put_user(cmd, buf)) {
+				spin_unlock(&proc->lock);
+				return -EFAULT;
+			}
+
+			proc->pending_loopers++;
+		}
+		spin_unlock(&proc->lock);
+		return sizeof(cmd);
 	}
 
 	return 0;
@@ -730,40 +991,68 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 {
 	struct bcmd_msg *msg;
 	struct msg_queue *q;
+	void __user *p = buf;
 	long n;
-	int r;
 
-	while (1) {
-		if (!msg_queue_empty(thread->queue))
+	n = binder_spawn_on_busy(proc, p, size);	// TODO: find a more suitable place
+	if (n > 0) {
+		p += n;
+		size -= n;
+	} else if (n < 0)
+		return n;
+
+	while (size >= sizeof(uint32_t)) {
+		if (!msg_queue_empty(thread->queue) || thread->pending_replies) {
 			q = thread->queue;
-		else if (!msg_queue_empty(proc->queue))
+			n = _bcmd_read_msg(q, &msg);
+		} else {
 			q = proc->queue;
-		else {	// sleep
+			n = bcmd_read_msg(q, &msg);
 		}
-
-		r = read_msg_queue(q, (struct list_head **)&msg);
-		if (r < 0)
-			return -EIO;
+		if (n < 0)
+			return n;
 
 		switch (msg->type) {
 			case BC_TRANSACTION:
 			case BC_REPLY:
-				n = bcmd_read_transaction(proc, thread, msg, buf, size);
-				if (n > 0) {
-					buf += n;
-					size -= n;
-				}
+				n = bcmd_read_transaction(proc, thread, &msg, p, size);
 				break;
 
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION:
-				n = bcmd_read_notifier(proc, thread, msg);
+				n = bcmd_read_notifier(proc, thread, &msg, p, size);
 				break;
 
 			case BR_DEAD_BINDER:
+				n = bcmd_read_dead_binder(proc, thread, &msg, p, size);
+				break;
+
+			default:
+				kfree(msg);
+				return -EFAULT;
 		}
 
+		if (msg && (n != -ENOSPC))
+			kfree(msg);
+
+		if (n > 0) {
+			p += n;
+			size -= n;
+		} else if (n < 0) {
+			if (n == -ENOSPC) {
+				if (msg) {	// put msg back to the queue. TODO: ugly
+					if (q == thread->queue)
+						_bcmd_write_msg_head(q, msg);
+					else
+						bcmd_write_msg_head(q, msg);
+				}
+				break;
+			} else
+				return n;
+		}
 	}
+
+	return (p - buf);
 }
 
 static inline int cmd_write_read(struct binder_proc *proc, struct binder_thread *thread, struct binder_write_read *bwr)
@@ -802,12 +1091,16 @@ static inline int cmd_set_context_mgr(struct binder_proc *proc)
 	if (!context_mgr_obj) 
 		return -EBUSY;
 
+	if (context_mgr_uid == -1)
+		context_mgr_uid = current->cred->euid;
+	else if (context_mgr_uid != current->cred->euid)
+		return -EPERM;
+
 	// TODO: protection
 	context_mgr_obj = binder_new_obj(proc, NULL);
 	if (!context_mgr_obj)
 		return -ENOMEM;
 
-	context_mgr_uid = current->cred->euid;
 	return 0;
 }
 
@@ -831,6 +1124,7 @@ static int binder_release(struct inode *nodp, struct file *filp)
 	struct binder_proc *proc = filp->private_data;
 
 	binder_free_proc(proc);
+	return 0;
 }
 
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)

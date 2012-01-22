@@ -134,7 +134,18 @@ int put_msg_queue(struct msg_queue *q)
 	return 1;
 }
 
-int write_msg_queue(struct msg_queue *q, struct list_head *msg)
+size_t msg_queue_size(struct msg_queue *q)
+{
+	size_t size;
+
+	spin_lock(&q->lock);
+	size = q->num_msgs;
+	spin_unlock(&q->lock);
+
+	return size;
+}
+
+static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head)
 {
 	int retval;
 	DECLARE_WAITQUEUE(wait, current);
@@ -151,7 +162,10 @@ int write_msg_queue(struct msg_queue *q, struct list_head *msg)
 
 		spin_lock(&q->lock);
 		if (q->num_msgs < q->max_msgs) {
-			list_add_tail(msg, &q->msgs);
+			if (head)
+				list_add_head(msg, &q->msgs);
+			else
+				list_add_tail(msg, &q->msgs);
 			q->num_msgs++;
 			spin_unlock(&q->lock);
 
@@ -174,7 +188,17 @@ int write_msg_queue(struct msg_queue *q, struct list_head *msg)
 	return retval;
 }
 
-int read_msg_queue(struct msg_queue *q, struct list_head **pmsg)
+int write_msg_queue(struct msg_queue *q, struct list_head *msg)
+{
+	return _write_msg_queue(q, msg, 0);
+}
+
+int write_msg_queue_head(struct msg_queue *q, struct list_head *msg)
+{
+	return _write_msg_queue(q, msg, 1);
+}
+
+static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tail)
 {
 	int retval;
 	struct list_head *entry;
@@ -192,7 +216,11 @@ int read_msg_queue(struct msg_queue *q, struct list_head **pmsg)
 
 		spin_lock(&q->lock);
 		if (!q->num_msgs) {
-			entry = q->msgs->next;
+			if (tail)
+				entry = q->msgs->prev;
+			else
+				entry = q->msgs->next;
+	
 			list_del(entry);
 			q->num_msgs--;
 			spin_unlock(&q->lock);
@@ -216,4 +244,14 @@ int read_msg_queue(struct msg_queue *q, struct list_head **pmsg)
 	remove_wait_queue(&q->rd_wait, &wait);
 
 	return retval;
+}
+
+int read_msg_queue(struct msg_queue *q, struct list_head **pmsg)
+{
+	return _read_msg_queue(q, pmsg, 0);
+}
+
+int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg)
+{
+	return _read_msg_queue(q, pmsg, 1);
 }

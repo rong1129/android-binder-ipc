@@ -34,7 +34,7 @@ struct msg_queue {
 	spinlock_t lock;
 	int active;
 	
-	unsigned long num_msgs, max_msgs;
+	size_t num_msgs, max_msgs;
 	struct list_head msgs;
 
 	wait_queue_head_t rd_wait;
@@ -50,8 +50,11 @@ extern struct msg_queue *create_msg_queue(unsigned long max_msgs, msg_release_ha
 extern int free_msg_queue(struct msg_queue *q);
 extern int get_msg_queue(struct msg_queue *q);
 extern int put_msg_queue(struct msg_queue *q);
+extern size_t msg_queue_size(struct msg_queue *q);
 extern int write_msg_queue(struct msg_queue *q, struct list_head *msg);
 extern int read_msg_queue(struct msg_queue *q, struct list_head **pmsg);
+extern int write_msg_queue_head(struct msg_queue *q, struct list_head *msg);
+extern int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg);
 
 static inline int msg_queue_empty(struct msg_queue *q)
 {
