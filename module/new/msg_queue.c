@@ -134,17 +134,6 @@ int put_msg_queue(struct msg_queue *q)
 	return 1;
 }
 
-size_t msg_queue_size(struct msg_queue *q)
-{
-	size_t size;
-
-	spin_lock(&q->lock);
-	size = q->num_msgs;
-	spin_unlock(&q->lock);
-
-	return size;
-}
-
 static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head)
 {
 	int retval;

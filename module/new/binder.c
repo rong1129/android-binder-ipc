@@ -116,7 +116,7 @@ struct bcmd_msg_buf {
 }
 
 struct bcmd_msg {
-	struct list_head list;		// has to be the first field so we can cast it around
+	struct list_head list;
 
 	obj_id_t obj_id;
 	unsigned int type;		// compat: review all data types in/out of the ioctl
@@ -154,6 +154,21 @@ static inline int obj_id_cmp(obj_id_t *a, obj_id_t *b)
 		return 0;
 }
 
+static void free_queued_msg(struct list_head *entry)
+{
+	struct bcmd_msg *msg = container_of(entry, struct bcmd_msg, list);
+
+	if (msg->type == BC_TRANSACTION) {
+		BUG_ON(!msg->reply_queue);
+
+		msg->type = BC_DEAD_BINDER;
+		if (!bcmd_write_msg(msg->reply_queue, msg))
+			return;
+	}
+
+	kfree(msg);
+}
+
 static struct binder_proc *binder_new_proc(struct file *filp)
 {
 	struct binder_proc *proc;
@@ -163,7 +178,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 		return NULL;
 
 	proc->non_block = (filp->f_flags & O_NONBLOCK) ? 1 : 0;
-	proc->queue = create_msg_queue(0, proc->non_block, free_transaction);
+	proc->queue = create_msg_queue(0, proc->non_block, free_queued_msg);
 	if (!proc->queue) {
 		kfree(proc);
 		return NULL;
@@ -181,49 +196,6 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	return proc;
 }
 
-static int binder_free_proc(struct binder_proc *proc)
-{
-	struct rb_node *n;
-
-	free_msg_queue(proc->queue);
-
-	while (n = rb_first(&proc->obj_tree)) {
-		obj = rb_entry(n, struct binder_obj, rb_node);
-	
-		rb_erase(n, &proc->obj_tree);
-		if (obj->obj_id.owner != proc->queue) {	// just reference
-			BUG_ON(!list_empty(&obj->notifiers));
-			kfree(obj);
-		} else {
-			struct binder_notifier *notifier;
-			struct bcmd_msg *msg = NULL;
-
-			list_for_each_entry_safe(notifier, &obj->notifiers, list) {
-				list_del(&notifier->list);
-
-				if (!msg) {
-					msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: ugly
-					if (!msg)
-						return -ENOMEM;
-				}
-
-				msg->type = BC_DEAD_BINDER;
-				msg->obj_id = obj->obj_id;
-				msg->cookie = notifier->cookie;
-				if (!bcmd_write_msg(notifier->notify_queue, msg))
-					msg = NULL;
-			}
-			if (msg)
-				kfree(msg);
-		}
-	}
-	
-	// free threads
-
-	kfree(proc);
-	return 0;
-}
-
 static struct binder_thread *binder_new_thread(struct file *filp, pid_t pid)
 {	
 	struct binder_thread *thread;
@@ -233,7 +205,7 @@ static struct binder_thread *binder_new_thread(struct file *filp, pid_t pid)
 		return NULL;
 
 	thread->non_block = (filp->f_flags & O_NONBLOCK) ? 1 : 0;
-	thread->queue = create_msg_queue(0, thread->non_block, free_transaction);
+	thread->queue = create_msg_queue(0, thread->non_block, free_queued_msg);
 	if (!thread->queue) {
 		kfree(thread);
 		return NULL;
@@ -281,16 +253,79 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc, struct 
 	return thread;
 }
 
-static struct binder_thread *binder_free_thread(struct binder_proc *proc, struct binder_thread *thread)
+static int binder_free_thread(struct binder_proc *proc, struct binder_thread *thread)
 {
+	struct bcmd_msg *msg = NULL;
+
+	free_msg_queue(thread->queue);
+
+	list_for_each_entry_safe(msg, &thread->incoming_transactions, list) {
+		list_del(&msg->list);
+
+		msg->type = BC_DEAD_BINDER;
+
+		BUG_ON(!msg->reply_queue);
+		if (bcmd_write_msg(msg->reply_queue, msg) < 0)
+			kfree(msg);
+	}
+
 	spin_lock(&proc->lock);
 	rb_erase(&thread->rb_node, &proc->thread_tree);
 	spin_unlock(&proc->lock);
 
-	free_msg_queue(thread->queue);
-
-	// failed reply
 	kfree(thread);
+	return 0;
+}
+
+static int binder_free_proc(struct binder_proc *proc)
+{
+	struct rb_node *n;
+	struct binder_thread *thread;
+	struct binder_obj *obj;
+
+	free_msg_queue(proc->queue);
+
+	while (n = rb_first(&proc->thread_tree)) {
+		thread = rb_entry(n, struct binder_thread, rb_node);
+		binder_free_thread(proc, thread);
+	}
+
+	spin_lock(&proc->lock);
+	while (n = rb_first(&proc->obj_tree)) {
+		obj = rb_entry(n, struct binder_obj, rb_node);
+
+		rb_erase(n, &proc->obj_tree);
+
+		if (obj->obj_id.owner != proc->queue) {	// just reference
+			BUG_ON(!list_empty(&obj->notifiers));
+			kfree(obj);
+		} else {
+			struct binder_notifier *notifier;
+			struct bcmd_msg *msg = NULL;
+
+			list_for_each_entry_safe(notifier, &obj->notifiers, list) {
+				list_del(&notifier->list);
+
+				if (!msg) {
+					msg = kmalloc(sizeof(*msg), GFP_KERNEL); // TODO: ugly
+					if (!msg)
+						return -ENOMEM;
+				}
+
+				msg->type = BC_DEAD_BINDER;
+				msg->obj_id = obj->obj_id;
+				msg->cookie = notifier->cookie;
+				if (!bcmd_write_msg(notifier->notify_queue, msg))
+					msg = NULL;
+			}
+			if (msg)
+				kfree(msg);
+		}
+	}
+	spin_unlock(&proc->lock);
+
+	kfree(proc);
+	return 0;
 }
 
 static struct binder_obj *_binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
@@ -514,7 +549,13 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 // used by the queue owner
 static inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
 {
-	return read_msg_queue(q, (struct list_head **)pmsg);
+	struct list_head *plist = &(*pmsg)->list;
+	int r;
+
+	r = read_msg_queue(q, &plist);
+	if (!r)
+		*pmsg = container_of(plist, struct bcmd_msg, list);
+	return r;
 }
 
 // used by any process
@@ -534,7 +575,7 @@ static inline int bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
 // used by the queue owner
 static inline int _bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 {
-	return write_msg_queue(q, (struct list_head *)msg);
+	return write_msg_queue(q, &msg->list);
 }
 
 // used by any process
@@ -554,7 +595,7 @@ static inline int bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 // used by the queue owner
 static inline int _bcmd_write_msg_head(struct msg_queue *q, struct bcmd_msg *msg)
 {
-	return write_msg_queue_head(q, (struct list_head *)msg);
+	return write_msg_queue_head(q, &msg->list);
 }
 
 // used by any process
@@ -1123,6 +1164,7 @@ static int binder_release(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc = filp->private_data;
 
+	// TODO: assume no more threads running
 	binder_free_proc(proc);
 	return 0;
 }
@@ -1226,4 +1268,3 @@ static void __exit binder_exit(void)
 module_init(binder_init);
 //module_exit(binder_exit);
 MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Rong Shen");

@@ -48,17 +48,24 @@ struct msg_queue {
 
 extern struct msg_queue *create_msg_queue(unsigned long max_msgs, msg_release_handler handler);
 extern int free_msg_queue(struct msg_queue *q);
+
 extern int get_msg_queue(struct msg_queue *q);
 extern int put_msg_queue(struct msg_queue *q);
-extern size_t msg_queue_size(struct msg_queue *q);
+
 extern int write_msg_queue(struct msg_queue *q, struct list_head *msg);
-extern int read_msg_queue(struct msg_queue *q, struct list_head **pmsg);
 extern int write_msg_queue_head(struct msg_queue *q, struct list_head *msg);
+
+extern int read_msg_queue(struct msg_queue *q, struct list_head **pmsg);
 extern int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg);
 
 static inline int msg_queue_empty(struct msg_queue *q)
 {
 	return !q->active || list_empty(&q->msgs);
+}
+
+static inline size_t msg_queue_size(struct msg_queue *q)
+{
+	return q->num_msgs;
 }
 
 #endif /* _MSG_QUEUE_H */

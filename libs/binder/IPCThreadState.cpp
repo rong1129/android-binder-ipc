@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#define INLINE_TRANSACTION_DATA
 #define LOG_TAG "IPCThreadState"
 
 #include <binder/IPCThreadState.h>
@@ -705,6 +706,13 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
                 LOG_ASSERT(err == NO_ERROR, "Not enough command data for brREPLY");
                 if (err != NO_ERROR) goto finish;
 
+#ifdef INLINE_TRANSACTION_DATA
+		void *tr_data = (uint8_t *)malloc(tr.data_size);
+
+		memcpy(tr_data, reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer), tr.data_size);
+		tr.data.ptr.buffer = tr_data;
+#endif
+
                 if (reply) {
                     if ((tr.flags & TF_STATUS_CODE) == 0) {
                         reply->ipcSetDataReference(
@@ -974,6 +982,13 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
                 "Not enough command data for brTRANSACTION");
             if (result != NO_ERROR) break;
             
+#ifdef INLINE_TRANSACTION_DATA
+            void *tr_data = malloc(tr.data_size);
+
+            memcpy(tr_data, reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer), tr.data_size);
+            tr.data.ptr.buffer = tr_data;
+#endif
+
             Parcel buffer;
             buffer.ipcSetDataReference(
                 reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
@@ -1115,9 +1130,14 @@ void IPCThreadState::freeBuffer(Parcel* parcel, const uint8_t* data, size_t data
     }
     LOG_ASSERT(data != NULL, "Called with NULL data");
     if (parcel != NULL) parcel->closeFileDescriptors();
+
+#ifdef INLINE_TRANSACTION_DATA
+    free((void *)data);
+#else
     IPCThreadState* state = self();
     state->mOut.writeInt32(BC_FREE_BUFFER);
     state->mOut.writeInt32((int32_t)data);
+#endif
 }
 
 }; // namespace android
