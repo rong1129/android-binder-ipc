@@ -6,7 +6,7 @@ binder_new-y	:= new/msg_queue.o new/binder.o
 
 else
 
-KDIR		?= /lib/modules/`uname -r`/build
+KDIR	?= /lib/modules/`uname -r`/build
 
 all:
 	$(MAKE) -C $(KDIR) V=0 M=$$PWD

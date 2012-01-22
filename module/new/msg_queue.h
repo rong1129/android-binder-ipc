@@ -18,6 +18,7 @@
 #ifndef _MSG_QUEUE_H
 #define _MSG_QUEUE_H
 
+#include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/wait.h>
@@ -27,7 +28,7 @@
 #define DEFAULT_MAX_QUEUE_LENGTH		100
 
 
-typedef void (*msg_release_handler)(struct list_head *msg);
+typedef void (*msg_release_handler)(struct list_head *);
 
 
 struct msg_queue {
@@ -44,9 +45,10 @@ struct msg_queue {
 	int usage; 
 
 	msg_release_handler release;
-}
+};
 
-extern struct msg_queue *create_msg_queue(unsigned long max_msgs, msg_release_handler handler);
+
+extern struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler);
 extern int free_msg_queue(struct msg_queue *q);
 
 extern int get_msg_queue(struct msg_queue *q);

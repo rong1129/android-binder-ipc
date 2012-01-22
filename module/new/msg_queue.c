@@ -34,7 +34,7 @@ static inline void rb_insert_queue(struct rb_node *node)
 		parent = *p;
 		if (node < parent)
 			p = &(*p)->rb_left;
-		else if (node > p)
+		else if (node > parent)
 			p = &(*p)->rb_right;
 		else
 			BUG();
@@ -61,7 +61,7 @@ static inline int rb_queue_exist(struct msg_queue *q)
 	return 0;
 }
 
-struct msg_queue *create_msg_queue(unsigned long max_msgs, msg_release_handler handler)
+struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler)
 {
 	struct msg_queue *q;
 
@@ -90,7 +90,7 @@ struct msg_queue *create_msg_queue(unsigned long max_msgs, msg_release_handler h
 int free_msg_queue(struct msg_queue *q)
 {
 	q->active = 0;
-	put_msg_queue(q);
+	return put_msg_queue(q);
 }
 
 int get_msg_queue(struct msg_queue *q)
@@ -120,15 +120,15 @@ int put_msg_queue(struct msg_queue *q)
 	spin_unlock(&g_queue_lock);
 
 	if (q->release) {
-		struct list_head *entry;
+		struct list_head *entry, *next;
 
-		list_for_each_safe(entry, &q->msgs) {
+		list_for_each_safe(entry, next, &q->msgs) {
 			list_del(entry);
 			q->release(entry);
 		}
 	}
 
-	BUG_ON(waitqueue_active(q->rd_wait) || waitqueue_active(q->wr_wait));
+	BUG_ON(waitqueue_active(&q->rd_wait) || waitqueue_active(&q->wr_wait));
 	kfree(q);
 
 	return 1;
@@ -152,7 +152,7 @@ static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head
 		spin_lock(&q->lock);
 		if (q->num_msgs < q->max_msgs) {
 			if (head)
-				list_add_head(msg, &q->msgs);
+				list_add(msg, &q->msgs);
 			else
 				list_add_tail(msg, &q->msgs);
 			q->num_msgs++;
@@ -204,11 +204,11 @@ static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tai
 		}
 
 		spin_lock(&q->lock);
-		if (!q->num_msgs) {
+		if (q->num_msgs > 0) {
 			if (tail)
-				entry = q->msgs->prev;
+				entry = q->msgs.prev;
 			else
-				entry = q->msgs->next;
+				entry = q->msgs.next;
 	
 			list_del(entry);
 			q->num_msgs--;
