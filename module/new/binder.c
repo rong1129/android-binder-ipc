@@ -110,8 +110,8 @@ struct bcmd_notifier_data {
 };
 
 struct bcmd_msg_buf {
-	void *data;
-	void *offsets;
+	uint8_t *data;
+	uint8_t *offsets;
 
 	size_t data_size;
 	size_t offsets_size;
@@ -620,7 +620,7 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 
 static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg_buf *buf, struct bcmd_transaction_data *tdata)
 {
-	size_t *p = buf->offsets, *ep = buf->offsets + buf->offsets_size, off;
+	size_t *p, *ep, off;
 	struct flat_binder_object *bp;
 	int r;
 
@@ -628,6 +628,8 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 	    copy_from_user(buf->offsets, tdata->data.ptr.offsets, buf->offsets_size))
 		return -EFAULT;
 
+	p = (size_t *)buf->offsets;
+	ep = (size_t *)(buf->offsets + buf->offsets_size);
 	while (p < ep) {
 		off = *p++;
 		if (off + sizeof(*bp) > buf->data_size)
@@ -898,8 +900,8 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	struct flat_binder_object *bp;
 	int r;
 
-	data_off = MSG_BUF_ALIGN(sizeof(cmd) + sizeof(tdata));
-	data_size = mbuf->data_size;
+	data_off = sizeof(cmd) + sizeof(tdata);
+	data_size = MSG_BUF_ALIGN(mbuf->data_size) + MSG_BUF_ALIGN(mbuf->offsets_size);
 	if (data_off + data_size > size)
 		return -ENOSPC;
 	data_buf = buf + data_off;
@@ -916,8 +918,8 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	tdata.data.ptr.buffer = data_buf;
 	tdata.data.ptr.offsets = data_buf + (mbuf->offsets - mbuf->data);
 
-	p = mbuf->offsets;
-	ep = mbuf->offsets + mbuf->offsets_size;
+	p = (size_t *)mbuf->offsets;
+	ep = (size_t *)(mbuf->offsets + mbuf->offsets_size);
 	while (p < ep) {
 		bp = (struct flat_binder_object *)(mbuf->data + *p++);
 
@@ -928,7 +930,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 
 	if (put_user(cmd, (uint32_t *)buf) ||
 	    copy_to_user(buf + sizeof(cmd), &tdata, sizeof(tdata)) ||
-	    copy_to_user(data_buf, mbuf->data, mbuf->data_size))
+	    copy_to_user(data_buf, mbuf->data, data_size))
 		return -EFAULT;
 
 	if (msg->type == BC_TRANSACTION) {

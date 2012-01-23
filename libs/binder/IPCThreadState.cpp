@@ -15,6 +15,8 @@
  */
 
 #define INLINE_TRANSACTION_DATA
+#define BUF_ALIGN(x)		(((x) + sizeof(void *) - 1) & ~(sizeof(void *) - 1))
+
 #define LOG_TAG "IPCThreadState"
 
 #include <binder/IPCThreadState.h>
@@ -709,8 +711,11 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
 #ifdef INLINE_TRANSACTION_DATA
 		void *tr_data = (uint8_t *)malloc(tr.data_size);
 
-		memcpy(tr_data, reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer), tr.data_size);
+		err = mIn.read(tr_data, BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
+                LOG_ASSERT(err == NO_ERROR, "Not enough transaction data for brREPLY");
+                if (err != NO_ERROR) goto finish;
 		tr.data.ptr.buffer = tr_data;
+		tr.data.ptr.offsets = (uint8_t *)tr_data + BUF_ALIGN(tr.data_size);
 #endif
 
                 if (reply) {
@@ -985,8 +990,11 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
 #ifdef INLINE_TRANSACTION_DATA
             void *tr_data = malloc(tr.data_size);
 
-            memcpy(tr_data, reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer), tr.data_size);
+            result = mIn.read(tr_data, BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
+            LOG_ASSERT(result == NO_ERROR, "Not enough transaction data for brTRANSACTION");
+            if (result != NO_ERROR) break;
             tr.data.ptr.buffer = tr_data;
+            tr.data.ptr.offsets = (uint8_t *)tr_data + BUF_ALIGN(tr.data_size);
 #endif
 
             Parcel buffer;
