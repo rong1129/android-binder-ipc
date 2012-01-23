@@ -21,8 +21,9 @@
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
-#include <linux/wait.h>
 #include <linux/rbtree.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
 
 
 #define DEFAULT_MAX_QUEUE_LENGTH		100
@@ -62,7 +63,12 @@ extern int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg);
 
 static inline int msg_queue_empty(struct msg_queue *q)
 {
-	return !q->active || list_empty(&q->msgs);
+	return (q->num_msgs < 1);
+}
+
+static inline int msg_queue_full(struct msg_queue *q)
+{
+	return (q->num_msgs >= q->max_msgs);
 }
 
 static inline size_t msg_queue_size(struct msg_queue *q)
@@ -70,4 +76,19 @@ static inline size_t msg_queue_size(struct msg_queue *q)
 	return q->num_msgs;
 }
 
+static inline void msg_queue_poll_wait(struct msg_queue *q, struct file *filp, poll_table *p)
+{
+	poll_wait(filp, &q->rd_wait, p);
+	poll_wait(filp, &q->wr_wait, p);
+}
+
+static inline void msg_queue_poll_wait_read(struct msg_queue *q, struct file *filp, poll_table *p)
+{
+	poll_wait(filp, &q->rd_wait, p);
+}
+
+static inline void msg_queue_poll_wait_write(struct msg_queue *q, struct file *filp, poll_table *p)
+{
+	poll_wait(filp, &q->wr_wait, p);
+}
 #endif /* _MSG_QUEUE_H */
