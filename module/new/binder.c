@@ -669,12 +669,10 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 			return -EINVAL;
 
 		bp = (struct flat_binder_object *)(mbuf->data + off);
-printk("process %d write flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 
 		r = bcmd_write_flat_obj(proc, thread, bp, mbuf->owners + n++);
 		if (r < 0)
 			return r;
-printk("process %d wrote flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 	}
 
 	return 0;
@@ -737,7 +735,6 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	msg->sender_euid = current->cred->euid;
 	msg->reply_queue = ((bcmd == BC_REPLY) || (tdata->flags & TF_ONE_WAY)) ? NULL : thread->queue; 
 
-printk("process %d write %s binder %p code %d, cookie %p, flags %d, sender %d\n", proc->pid, (msg->type==BC_TRANSACTION) ? "trans" : "reply", msg->binder, msg->code, msg->cookie, msg->flags, msg->sender_pid);
 	if (tdata->data_size > 0) {
 		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0) {
 			err = BR_FAILED_REPLY;
@@ -944,7 +941,6 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	if (data_off + data_size > size)
 		return -ENOSPC;
 
-printk("process %d read %s binder %p code %d, cookie %p, flags %d, sender %d\n", proc->pid, (msg->type==BC_TRANSACTION) ? "trans" : "reply", msg->binder, msg->code, msg->cookie, msg->flags, msg->sender_pid);
 	tdata.target.ptr = msg->binder;
 	tdata.code = msg->code;
 	tdata.cookie = msg->cookie;
@@ -974,7 +970,6 @@ printk("process %d read %s binder %p code %d, cookie %p, flags %d, sender %d\n",
 				r = bcmd_read_flat_obj(proc, thread, bp, mbuf->owners[n++]);
 				if (r < 0)
 					return r;
-printk("process %d read flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 			}
 
 			tdata.data.ptr.offsets = data_buf + (mbuf->offsets - mbuf->data);
