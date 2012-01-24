@@ -34,7 +34,8 @@
 
 
 #define MAX_TRANSACTION_SIZE			4000
-#define MSG_BUF_ALIGN(n)			ALIGN((n), sizeof(void *))
+#define OBJ_HASH_BUCKET_SIZE			128
+#define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
 
 
 enum {	// compat: review looper idea
@@ -55,6 +56,8 @@ struct binder_proc {
 
 	spinlock_t obj_lock;
 	struct rb_root obj_tree;
+	struct hlist_head obj_hash[OBJ_HASH_BUCKET_SIZE];
+	unsigned long obj_seq;
 
 	struct msg_queue *queue;
 
@@ -92,6 +95,9 @@ struct binder_obj {
 
 	struct rb_node rb_node;
 
+	unsigned long ref;
+	struct hlist_node hash_node;
+
 	spinlock_t lock;		// used for notifiers only
 	struct list_head notifiers;	// TODO: slow deletion
 };
@@ -99,7 +105,7 @@ struct binder_obj {
 #define bcmd_transaction_data	binder_transaction_data
 
 struct bcmd_notifier_data {
-	void *binder;
+	long handle;
 	void *cookie;
 };
 
@@ -182,11 +188,24 @@ static inline struct binder_obj *binder_find_my_obj(struct binder_proc *proc, vo
 	return binder_find_obj(proc, proc->queue, binder);
 }
 
-static inline struct binder_obj *binder_find_my_ref(struct binder_proc *proc, void *binder)
+static struct binder_obj *binder_find_obj_by_ref(struct binder_proc *proc, unsigned long ref)
 {
-	struct binder_obj *obj = (struct binder_obj *)binder;	//TODO: dangerous!!!
+	struct binder_obj *obj;
+	struct hlist_head *head;
+	struct hlist_node *node;
 
-	return binder_find_obj(proc, obj->owner, obj->binder);
+	spin_lock(&proc->obj_lock);
+
+	head = &proc->obj_hash[ref % OBJ_HASH_BUCKET_SIZE];
+	hlist_for_each_entry(obj, node, head, hash_node) {
+		if (obj->ref == ref) {
+			spin_unlock(&proc->obj_lock);
+			return obj;
+		}
+	}
+
+	spin_unlock(&proc->obj_lock);
+	return NULL;
 }
 
 static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner, void *binder, void *cookie)
@@ -226,12 +245,15 @@ static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner,
 	rb_link_node(&new_obj->rb_node, parent, p);
 	rb_insert_color(&new_obj->rb_node, &proc->obj_tree);
 
+	new_obj->ref = proc->obj_seq++;
+	hlist_add_head(&new_obj->hash_node, &proc->obj_hash[new_obj->ref % OBJ_HASH_BUCKET_SIZE]);
+
 	spin_unlock(&proc->obj_lock);
 
 	return new_obj;
 }
 
-static struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder, void *cookie)
+static inline struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder, void *cookie)
 {
 	return _binder_new_obj(proc, proc->queue, binder, cookie);
 }
@@ -370,6 +392,7 @@ static void free_queued_msg(struct list_head *entry)
 static struct binder_proc *binder_new_proc(struct file *filp)
 {
 	struct binder_proc *proc;
+	int i;
 
 	proc = kmalloc(sizeof(*proc), GFP_KERNEL);
 	if (!proc)
@@ -390,6 +413,10 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 
 	spin_lock_init(&proc->lock);
 	proc->thread_tree.rb_node = NULL;
+
+	for (i = 0; i < sizeof(proc->obj_hash) / sizeof(proc->obj_hash[0]); i++)
+		INIT_HLIST_HEAD(&proc->obj_hash[i]);
+	proc->obj_seq = 1;	// compat: context_mgr_node starts 0?
 
 	spin_lock_init(&proc->obj_lock);
 	proc->obj_tree.rb_node = NULL;
@@ -536,6 +563,7 @@ static int binder_free_proc(struct binder_proc *proc)
 		obj = rb_entry(n, struct binder_obj, rb_node);
 
 		rb_erase(n, &proc->obj_tree);
+		hlist_del(&obj->hash_node);
 
 		r = binder_free_obj(proc, obj);
 		if (r < 0)
@@ -568,11 +596,12 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 
 		case BINDER_TYPE_HANDLE:
 		case BINDER_TYPE_WEAK_HANDLE:
-			obj = binder_find_my_ref(proc, bp->binder);
+			obj = binder_find_obj_by_ref(proc, bp->handle);
 			if (!obj)
 				return -EINVAL;
 
 			bp->binder = obj->binder;
+			bp->cookie = obj->cookie;
 			break;
 
 		default: 
@@ -598,12 +627,12 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 					bp->cookie = obj->cookie;	// compat
 				}
 			} else {
-				obj = _binder_new_obj(proc, owner, bp->binder, NULL);
+				obj = _binder_new_obj(proc, owner, bp->binder, bp->cookie);
 				if (!obj)
 					return -ENOMEM;
 			}
 
-			bp->binder = obj;	// reference
+			bp->handle = (long)obj->ref;
 			break;
 
 		/* No more these types */
@@ -640,10 +669,12 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 			return -EINVAL;
 
 		bp = (struct flat_binder_object *)(mbuf->data + off);
+printk("process %d write flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 
 		r = bcmd_write_flat_obj(proc, thread, bp, mbuf->owners + n++);
 		if (r < 0)
 			return r;
+printk("process %d wrote flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 	}
 
 	return 0;
@@ -653,17 +684,16 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 {
 	struct bcmd_msg *msg;
 	struct msg_queue *q;
-	void *binder;
+	void *binder, *cookie;
 	uint32_t err;
 
 	if (bcmd == BC_TRANSACTION) {
-		void *binder = (void *)tdata->target.handle;
 		struct binder_obj *obj;
 
-		if (unlikely(!binder))
+		if (unlikely(!tdata->target.handle))
 			obj = context_mgr_obj;
 		else
-			obj = binder_find_my_ref(proc, binder);
+			obj = binder_find_obj_by_ref(proc, tdata->target.handle);
 
 		if (!obj) {
 			err = BR_FAILED_REPLY;
@@ -678,6 +708,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 
 		q = obj->owner;
 		binder = obj->binder;
+		cookie = obj->cookie;
 	} else {
 		// compat: pop out the top transaction without checking
 		if (list_empty(&thread->incoming_transactions)) {
@@ -688,7 +719,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		list_del(&msg->list);
 
 		q = msg->reply_queue;
-		binder = NULL;		// compat
+		binder = cookie = NULL;		// compat
 
 		msg = binder_realloc_msg(msg, tdata->data_size, tdata->offsets_size);
 		if (!msg) {
@@ -699,13 +730,14 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 
 	msg->type = bcmd;
 	msg->binder = binder;
+	msg->cookie = cookie;	// compat: ignore cookie in tdata - strange
 	msg->code = tdata->code;
-	msg->cookie = tdata->cookie;
 	msg->flags = tdata->flags;
 	msg->sender_pid = proc->pid;
 	msg->sender_euid = current->cred->euid;
 	msg->reply_queue = ((bcmd == BC_REPLY) || (tdata->flags & TF_ONE_WAY)) ? NULL : thread->queue; 
 
+printk("process %d write %s binder %p code %d, cookie %p, flags %d, sender %d\n", proc->pid, (msg->type==BC_TRANSACTION) ? "trans" : "reply", msg->binder, msg->code, msg->cookie, msg->flags, msg->sender_pid);
 	if (tdata->data_size > 0) {
 		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0) {
 			err = BR_FAILED_REPLY;
@@ -753,7 +785,7 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	struct bcmd_msg *msg;
 	uint32_t err;
 
-	obj = binder_find_my_ref(proc, notifier->binder);
+	obj = binder_find_obj_by_ref(proc, notifier->handle);
 	if (!obj) {
 		err = BR_FAILED_REPLY;
 		goto failed_obj;
@@ -865,14 +897,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 					return -EFAULT;
 				p += sizeof(notifier);
 
-				/* compat/TODO: BROKEN!!! 
-				   We expect these commands would send us back the original binder cookie as others do,
-				   which has been hijacked for carrying object owner information (temporary, until the 
-                                   interfacing can be changed). Unfortunately for these two commands, they want to attach
-                                   their own cookies, and not sending the binder cookie back, so there's no way we can
-                                   retrieve their reference.
 				err += bcmd_write_notifier(proc, thread, &notifier, bcmd);
-                                */
 				break;
 			}
 
@@ -919,6 +944,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	if (data_off + data_size > size)
 		return -ENOSPC;
 
+printk("process %d read %s binder %p code %d, cookie %p, flags %d, sender %d\n", proc->pid, (msg->type==BC_TRANSACTION) ? "trans" : "reply", msg->binder, msg->code, msg->cookie, msg->flags, msg->sender_pid);
 	tdata.target.ptr = msg->binder;
 	tdata.code = msg->code;
 	tdata.cookie = msg->cookie;
@@ -948,6 +974,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 				r = bcmd_read_flat_obj(proc, thread, bp, mbuf->owners[n++]);
 				if (r < 0)
 					return r;
+printk("process %d read flat obj #%d: type %s, flags %lu, binder %p, cookie %p\n", proc->pid, n, (bp->type==BINDER_TYPE_BINDER||bp->type==BINDER_TYPE_WEAK_BINDER)? "binder":"handle", bp->flags, bp->binder, bp->cookie);
 			}
 
 			tdata.data.ptr.offsets = data_buf + (mbuf->offsets - mbuf->data);
