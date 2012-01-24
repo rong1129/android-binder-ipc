@@ -643,8 +643,13 @@ IPCThreadState::IPCThreadState()
 {
     pthread_setspecific(gTLS, this);
     clearCaller();
+#ifdef INLINE_TRANSACTION_DATA
+    mIn.setDataCapacity(2048);
+    mOut.setDataCapacity(2048);
+#else
     mIn.setDataCapacity(256);
     mOut.setDataCapacity(256);
+#endif
 }
 
 IPCThreadState::~IPCThreadState()
@@ -709,13 +714,12 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
                 if (err != NO_ERROR) goto finish;
 
 #ifdef INLINE_TRANSACTION_DATA
-		void *tr_data = (uint8_t *)malloc(tr.data_size);
+		const void *tr_buf = mIn.readInplace(BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
 
-		err = mIn.read(tr_data, BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
-                LOG_ASSERT(err == NO_ERROR, "Not enough transaction data for brREPLY");
-                if (err != NO_ERROR) goto finish;
-		tr.data.ptr.buffer = tr_data;
-		tr.data.ptr.offsets = (uint8_t *)tr_data + BUF_ALIGN(tr.data_size);
+                LOG_ASSERT(tr_buf != NULL, "Not enough transaction data for brREPLY");
+                if (tr_buf == NULL) goto finish;
+		tr.data.ptr.buffer = tr_buf;
+		tr.data.ptr.offsets = (uint8_t *)tr_buf + BUF_ALIGN(tr.data_size);
 #endif
 
                 if (reply) {
@@ -988,13 +992,12 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
             if (result != NO_ERROR) break;
             
 #ifdef INLINE_TRANSACTION_DATA
-            void *tr_data = malloc(tr.data_size);
+	    const void *tr_buf = mIn.readInplace(BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
 
-            result = mIn.read(tr_data, BUF_ALIGN(tr.data_size) + BUF_ALIGN(tr.offsets_size));
-            LOG_ASSERT(result == NO_ERROR, "Not enough transaction data for brTRANSACTION");
-            if (result != NO_ERROR) break;
-            tr.data.ptr.buffer = tr_data;
-            tr.data.ptr.offsets = (uint8_t *)tr_data + BUF_ALIGN(tr.data_size);
+            LOG_ASSERT(tr_buf != NULL, "Not enough transaction data for brTRANSACTION");
+            if (tr_buf == NULL) break;
+            tr.data.ptr.buffer = tr_buf;
+            tr.data.ptr.offsets = (uint8_t *)tr_buf + BUF_ALIGN(tr.data_size);
 #endif
 
             Parcel buffer;
@@ -1139,13 +1142,9 @@ void IPCThreadState::freeBuffer(Parcel* parcel, const uint8_t* data, size_t data
     LOG_ASSERT(data != NULL, "Called with NULL data");
     if (parcel != NULL) parcel->closeFileDescriptors();
 
-#ifdef INLINE_TRANSACTION_DATA
-    free((void *)data);
-#else
     IPCThreadState* state = self();
     state->mOut.writeInt32(BC_FREE_BUFFER);
     state->mOut.writeInt32((int32_t)data);
-#endif
 }
 
 }; // namespace android

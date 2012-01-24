@@ -9,6 +9,9 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#define INLINE_TRANSACTION_DATA
+#define BUF_ALIGN(x)		(((x) + sizeof(void *) - 1) & ~(sizeof(void *) - 1))
+
 #include "binder.h"
 
 #define MAX_BIO_SIZE (1 << 30)
@@ -143,6 +146,7 @@ int binder_write(struct binder_state *bs, void *data, unsigned len)
 {
     struct binder_write_read bwr;
     int res;
+
     bwr.write_size = len;
     bwr.write_consumed = 0;
     bwr.write_buffer = (unsigned) data;
@@ -235,6 +239,9 @@ int binder_parse(struct binder_state *bs, struct binder_io *bio,
                 binder_send_reply(bs, &reply, txn->data, res);
             }
             ptr += sizeof(*txn) / sizeof(uint32_t);
+#ifdef INLINE_TRANSACTION_DATA
+            ptr += (BUF_ALIGN(txn->data_size)+ BUF_ALIGN(txn->offs_size)) / sizeof(uint32_t);
+#endif
             break;
         }
         case BR_REPLY: {
@@ -251,6 +258,9 @@ int binder_parse(struct binder_state *bs, struct binder_io *bio,
                     /* todo FREE BUFFER */
             }
             ptr += (sizeof(*txn) / sizeof(uint32_t));
+#ifdef INLINE_TRANSACTION_DATA
+            ptr += (BUF_ALIGN(txn->data_size)+ BUF_ALIGN(txn->offs_size)) / sizeof(uint32_t);
+#endif
             r = 0;
             break;
         }
@@ -310,7 +320,11 @@ int binder_call(struct binder_state *bs,
         uint32_t cmd;
         struct binder_txn txn;
     } writebuf;
+#ifdef INLINE_TRANSACTION_DATA
+    unsigned readbuf[1024];
+#else
     unsigned readbuf[32];
+#endif
 
     if (msg->flags & BIO_F_OVERFLOW) {
         fprintf(stderr,"binder: txn buffer overflow\n");
@@ -358,7 +372,11 @@ void binder_loop(struct binder_state *bs, binder_handler func)
 {
     int res;
     struct binder_write_read bwr;
+#ifdef INLINE_TRANSACTION_DATA
+    unsigned readbuf[1024];
+#else
     unsigned readbuf[32];
+#endif
 
     bwr.write_size = 0;
     bwr.write_consumed = 0;
