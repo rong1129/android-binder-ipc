@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <errno.h>
 
 #ifndef uint8_t 
 #define uint8_t unsigned char
@@ -12,6 +13,43 @@
 
 #define ALIGN(n)	(((n) + 3) & ~3)
 
+
+int send_reply(int fd, struct binder_transaction_data *tdata_in)
+{	
+	int r;
+	struct binder_write_read bwr;
+	unsigned int wbuf[1024];
+	struct binder_transaction_data *tdata;
+
+	if (tdata->flags & TF_ONE_WAY)
+		return 0;
+
+	wbuf[0] = BC_REPLY;
+	tdata = (struct binder_transaction_data *)(&wbuf[1]);
+
+	memset(tdata, 0, sizeof(*tdata));
+
+	tdata->target.handle = tdata_in->target.handle;
+	tdata->cookie = tdata_in->cookie;
+	tdata->code = tdata_in->code;
+	tdata->flags = tdata_in->flags;
+	tdata->data_size = 0;
+	tdata->offsets_size = 0;
+	tdata->data.ptr.buffer = NULL;
+	tdata->data.ptr.offsets = NULL;
+
+	memset(&bwr, 0, sizeof(bwr));
+	bwr.write_buffer = (unsigned long)wbuf;
+	bwr.write_size = sizeof(wbuf[0]) + sizeof(*tdata);
+
+	r = ioctl(fd, BINDER_WRITE_READ, &bwr);
+	if (r < 0) {
+		fprintf(stderr, "Failed to write command: %d\n", errno);
+		return -1;
+	}
+
+	return r;
+}
 
 void hexdump(const void *buf, unsigned long size)
 {
@@ -124,6 +162,10 @@ int parse_command(int fd, void *buf, unsigned long size)
 				printf("Objects dump:\n");
 				objdump(tdata->data.ptr.buffer, tdata->data.ptr.offsets, tdata->offsets_size);
 
+				if (send_reply(fd, tdata) < 0) {
+					fprintf(stderr, "failed to send reply\n");
+					return -1;
+				}
 				p += buffer_size;
 				break;
 

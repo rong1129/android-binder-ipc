@@ -234,8 +234,6 @@ int main(int argc, char **argv)
 	memset(&bwr, 0, sizeof(bwr));
 	bwr.write_buffer = (unsigned long)wbuf;
 	bwr.write_size = sizeof(wbuf[0]) + sizeof(*tdata);
-	bwr.read_buffer = (unsigned long)rbuf;
-	bwr.read_size = sizeof(rbuf);
 
 	r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 	if (r < 0) {
@@ -243,13 +241,22 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	printf("Write consumed %ld (%ld) bytes\n", bwr.write_consumed, bwr.write_size);
-	printf("Read consumed %ld (%ld) bytes\n", bwr.read_consumed, bwr.read_size);
+	while (1) {
+		memset(&bwr, 0, sizeof(bwr));
+		bwr.read_buffer = (unsigned long)rbuf;
+		bwr.read_size = sizeof(rbuf);
 
-	if (bwr.read_consumed > 0) {
-		r = parse_command(fd, rbuf, bwr.read_consumed);
-		if (r < 0) 
+		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
+		if (r < 0) {
+			fprintf(stderr, "Failed to write command: %d\n", errno);
 			return -1;
+		}
+
+		if (bwr.read_consumed > 0) {
+			r = parse_command(fd, rbuf, bwr.read_consumed);
+			if (r < 0) 
+				return -1;
+		}
 	}
 
 	return 0;
