@@ -588,6 +588,19 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 				obj = binder_new_obj(proc, bp->binder, bp->cookie);
 				if (!obj)
 					return -ENOMEM;
+
+				// Hack/TODO: it's hacked to avoid service from crashing when no one holds a strong ref
+				if (1) {
+					struct bcmd_msg *msg; 
+
+					msg = binder_alloc_msg(0, 0);
+					if (!msg)
+						return -ENOMEM;
+					msg->type = BR_ACQUIRE;
+					msg->binder = bp->binder;
+					msg->cookie = bp->cookie;
+					_bcmd_write_msg(thread->queue, msg);
+				}			
 			} else if (bp->cookie != obj->cookie)
 				return -ENOMEM;
 
@@ -1086,6 +1099,25 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 	return sizeof(cmd) * 2;
 }
 
+//Hack/TODO
+static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
+{
+	struct bcmd_msg *msg = *pmsg;
+	uint32_t cmd = msg->type, *p = (uint32_t *)buf;
+
+	if (size < sizeof(cmd) * 3)
+		return -ENOSPC;
+
+	if (put_user(cmd, p++) || 
+	    put_user((uint32_t)msg->binder, p++) ||
+	    put_user((uint32_t)msg->cookie, p++))
+		return -EFAULT;
+
+	kfree(*pmsg);
+	*pmsg = NULL;
+	return sizeof(cmd) * 3;
+}
+
 static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsigned long size)
 {
 	uint32_t cmd = BR_SPAWN_LOOPER;
@@ -1167,6 +1199,11 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION:
 				n = bcmd_read_notifier(proc, thread, &msg, p, size);
+				break;
+
+			// Hack/TODO
+			case BR_ACQUIRE:
+				n = bcmd_read_acquire(proc, thread, &msg, p, size);
 				break;
 
 			default:
