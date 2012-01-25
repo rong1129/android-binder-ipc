@@ -2,39 +2,49 @@
 
 To Build:
 
-1. Build binder module
-	cd module; make
-	* see gen_deps.sh/deps.c for how missing symbols are created 
+1. Build binder module(s)
+	$ cd module; make
+	* Two drivers built: binder_new.ko the version I'm working on, and binder_old.ko the existing binder driver
+	* For binder_old.ko, see gen_deps.sh & deps.c for how missing symbols are patched :) 
 
 2. Build service manager
-	cd servicemanager; make
+	$ cd servicemanager; make
 
 3. Build binder library
-	cd libs; make
+	$ cd libs; make
 
 4. Build the test program
-	cd test; make
+	$ cd test; make
 
 
 To Test (run as root for now)
 1. Load driver
-	cd moudle; insmod binder_x86.ko
+	# cd moudle; insmod binder_new.ko
 
 2. Start service manager
-	cd servicemanager; ./servicemanager &
+	# cd servicemanager; ./servicemanager &
 
 3. Run the test program 
-	cd test;
-	./binderAddInts -n 10000
+	# cd test
+	# ./binderAddInts -n 10000
+	# ./binderAddInts -n 10000 -d 0
 
+Notes:
+1. The two drivers are currently incompatible. To run the above tests on the old driver, one needs to comment out INLINE_TRANSACTION_DATA macro in the following two files and recompile everything:
+	libs/binder/IPCThreadState.cpp
+	servicemanager/binder.c
+
+
+2. With the old driver, run the above two tests - one with delay between iterations and the other one without - you see the average iteration delay is much longer for the one without delay. It's most likely due to inefficient locking in the binder driver, i.e. global binder_lock. So I guess it's step one for this project to address.
+
+	# ./binderAddInts -n 10000
 serverCPU:  unbound
 clientCPU:  unbound
 iterations: 10000
 iterDelay: 0.001
 Time per iteration min: 0.000151486 avg: 0.000181443 max: 0.00497661
 
-	./binderAddInts -n 10000 -d 0
-
+	# ./binderAddInts -n 10000 -d 0
 serverCPU:  unbound
 clientCPU:  unbound
 iterations: 10000
@@ -42,6 +52,18 @@ iterDelay: 0
 Time per iteration min: 0.000139962 avg: 0.000258004 max: 0.00490384
 
 
-Problems:
-1. Compare the results above: one with delay between iterations and the other one without, you see the average iteration delay is much longer for the one without delay. 
-* It's most likely due to inefficient locking in the binder driver, i.e. global binder_lock. So I guess it's step one for this project to address.
+3. The current results of the new driver. Not so much better, but it's just some first tests, tuning on the way
+	# ./binderAddInts -n 10000
+serverCPU:  unbound
+clientCPU:  unbound
+iterations: 10000
+iterDelay: 0.001
+Time per iteration min: 0.000142057 avg: 0.000203101 max: 0.00329881
+
+	# ./binderAddInts -n 10000 -d 0
+serverCPU:  unbound
+clientCPU:  unbound
+iterations: 10000
+iterDelay: 0
+Time per iteration min: 0.000139124 avg: 0.000242037 max: 0.00243285
+
