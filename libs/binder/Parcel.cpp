@@ -292,7 +292,7 @@ Parcel::Parcel()
 
 Parcel::~Parcel()
 {
-    //freeDataNoInit();
+    freeDataNoInit();
 }
 
 const uint8_t* Parcel::data() const
