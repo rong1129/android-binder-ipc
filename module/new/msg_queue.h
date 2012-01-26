@@ -29,7 +29,9 @@
 #define DEFAULT_MAX_QUEUE_LENGTH		100
 
 
-typedef void (*msg_release_handler)(struct list_head *);
+struct msg_queue;
+
+typedef void (*queue_release_handler)(struct msg_queue *q, void *);
 
 
 struct msg_queue {
@@ -45,11 +47,12 @@ struct msg_queue {
 	struct rb_node rb_node;
 	int usage; 
 
-	msg_release_handler release;
+	queue_release_handler release;
+	void *private;
 };
 
 
-extern struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler);
+extern struct msg_queue *create_msg_queue(size_t max_msgs, queue_release_handler handler, void *data);
 extern int free_msg_queue(struct msg_queue *q);
 
 extern int get_msg_queue(struct msg_queue *q);
@@ -74,6 +77,18 @@ static inline int msg_queue_full(struct msg_queue *q)
 static inline size_t msg_queue_size(struct msg_queue *q)
 {
 	return q->num_msgs;
+}
+
+// Unsafe! Only use it when no one else is accessing the queue
+static inline struct list_head *msg_queue_pop(struct msg_queue *q)
+{
+	struct list_head *next = q->msgs.next;
+
+	if (next != &q->msgs) {
+		list_del(next);
+		return next;
+	} else
+		return NULL;
 }
 
 static inline void msg_queue_poll_wait(struct msg_queue *q, struct file *filp, poll_table *p)

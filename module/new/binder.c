@@ -28,6 +28,8 @@
 #include <linux/atomic.h>
 #include <linux/uaccess.h>
 #include <linux/miscdevice.h>
+#include <linux/seq_file.h>
+#include <linux/debugfs.h>
 
 #include "msg_queue.h"
 #include "binder.h"
@@ -65,6 +67,8 @@ struct binder_proc {
 
 	int max_threads;
 	atomic_t num_loopers, busy_loopers, requested_loopers;
+
+	struct dentry *proc_dir, *thread_dir, *obj_dir;
 };
 
 struct binder_thread {
@@ -77,8 +81,10 @@ struct binder_thread {
 	int non_block;
 	unsigned int last_error;
 
-	unsigned int pending_replies;
+	int pending_replies;
 	struct list_head incoming_transactions;
+
+	struct dentry *info_node;
 };
 
 struct binder_notifier {
@@ -100,6 +106,8 @@ struct binder_obj {
 
 	spinlock_t lock;		// used for notifiers only
 	struct list_head notifiers;	// TODO: slow deletion
+
+	struct dentry *info_node;
 };
 
 #define bcmd_transaction_data	binder_transaction_data
@@ -138,9 +146,24 @@ struct bcmd_msg {
 	struct msg_queue *reply_queue;
 };
 
+struct debugfs_priv {
+	struct msg_queue *owner;
+	struct binder_proc *proc;
+	unsigned long data;
+};
+
 
 static struct binder_obj *context_mgr_obj;	// compat: is context mgr necessary?
 static uid_t context_mgr_uid = -1;
+
+static struct dentry *debugfs_root;
+
+
+static int binder_free_proc(struct binder_proc *proc);
+
+static int debugfs_new_proc(struct binder_proc *proc);
+static int debugfs_new_thread(struct binder_proc *proc, struct binder_thread *thread);
+static int debugfs_new_obj(struct binder_proc *proc, struct binder_obj *obj);
 
 
 static inline int binder_cmp(void *owner0, void *binder0, void *owner1, void *binder1)
@@ -249,6 +272,15 @@ static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner,
 	hlist_add_head(&new_obj->hash_node, &proc->obj_hash[new_obj->ref % OBJ_HASH_BUCKET_SIZE]);
 
 	spin_unlock(&proc->obj_lock);
+
+	if (debugfs_new_obj(proc, new_obj) < 0) {
+		spin_lock(&proc->obj_lock);
+		rb_erase(&new_obj->rb_node, &proc->obj_tree);
+		hlist_del(&new_obj->hash_node);
+		spin_unlock(&proc->obj_lock);
+		kfree(new_obj);
+		return NULL;
+	}
 
 	return new_obj;
 }
@@ -374,19 +406,31 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	return binder_alloc_msg(data_size, offsets_size);
 }
 
-static void free_queued_msg(struct list_head *entry)
+static void msg_queue_release(struct msg_queue *q, void *data)
 {
-	struct bcmd_msg *msg = container_of(entry, struct bcmd_msg, list);
+	struct list_head *entry;
+	struct bcmd_msg *msg;
 
-	if (msg->type == BC_TRANSACTION) {
-		BUG_ON(!msg->reply_queue);
+	while ((entry = msg_queue_pop(q))) {
+		msg = container_of(entry, struct bcmd_msg, list);
 
-		msg->type = BR_DEAD_BINDER;
-		if (!bcmd_write_msg(msg->reply_queue, msg))
-			return;
+		if (msg->type == BC_TRANSACTION) {
+			msg->type = BR_DEAD_BINDER;
+			if (!bcmd_write_msg(msg->reply_queue, msg))
+				return;
+		}
+
+		kfree(msg);
 	}
+}
 
-	kfree(msg);
+static void proc_msg_queue_release(struct msg_queue *q, void *data)
+{
+	struct binder_proc *proc = data;
+
+	msg_queue_release(q, NULL);
+
+	binder_free_proc(proc);
 }
 
 static struct binder_proc *binder_new_proc(struct file *filp)
@@ -398,7 +442,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	if (!proc)
 		return NULL;
 
-	proc->queue = create_msg_queue(0, free_queued_msg);
+	proc->queue = create_msg_queue(0, proc_msg_queue_release, proc);
 	if (!proc->queue) {
 		kfree(proc);
 		return NULL;
@@ -421,6 +465,12 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	spin_lock_init(&proc->obj_lock);
 	proc->obj_tree.rb_node = NULL;
 
+	if (debugfs_new_proc(proc) < 0) {
+		// the queue release handle will free proc struct
+		free_msg_queue(proc->queue);
+		return NULL;
+	}
+
 	return proc;
 }
 
@@ -432,7 +482,7 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 	if (!thread)
 		return NULL;
 
-	thread->queue = create_msg_queue(0, free_queued_msg);
+	thread->queue = create_msg_queue(0, msg_queue_release, NULL);
 	if (!thread->queue || get_msg_queue(proc->queue) < 0) {
 		kfree(thread);
 		return NULL;
@@ -445,6 +495,12 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 
 	thread->pending_replies = 0;
 	INIT_LIST_HEAD(&thread->incoming_transactions);
+
+	if (debugfs_new_thread(proc, thread) < 0) {
+		free_msg_queue(thread->queue);
+		kfree(thread);
+		return NULL;
+	}
 
 	return thread;
 }
@@ -488,6 +544,8 @@ static int binder_free_thread(struct binder_proc *proc, struct binder_thread *th
 {
 	struct bcmd_msg *msg, *next;
 
+	debugfs_remove(thread->info_node);
+
 	put_msg_queue(proc->queue);
 	free_msg_queue(thread->queue);
 
@@ -511,6 +569,8 @@ static int binder_free_thread(struct binder_proc *proc, struct binder_thread *th
 
 static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 {
+	debugfs_remove(obj->info_node);
+
 	if (obj->owner == proc->queue) {
 		struct binder_notifier *notifier, *next;
 		struct bcmd_msg *msg = NULL;
@@ -549,8 +609,6 @@ static int binder_free_proc(struct binder_proc *proc)
 	struct binder_obj *obj;
 	int r;
 
-	free_msg_queue(proc->queue);
-
 	while ((n = rb_first(&proc->thread_tree))) {
 		thread = rb_entry(n, struct binder_thread, rb_node);
 		r = binder_free_thread(proc, thread);
@@ -566,11 +624,14 @@ static int binder_free_proc(struct binder_proc *proc)
 		hlist_del(&obj->hash_node);
 
 		r = binder_free_obj(proc, obj);
-		if (r < 0)
+		if (r < 0) {
+			spin_unlock(&proc->lock);
 			return r;
+		}
 	}
 	spin_unlock(&proc->lock);
 
+	debugfs_remove_recursive(proc->proc_dir);
 	kfree(proc);
 	return 0;
 }
@@ -1170,7 +1231,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 	atomic_inc(&proc->busy_loopers);
 
 	while (size >= sizeof(uint32_t)) {
-		if (thread->pending_replies || !msg_queue_empty(thread->queue))
+		if (thread->pending_replies > 0 || !msg_queue_empty(thread->queue))
 			q = thread->queue;
 		else
 			q = proc->queue;
@@ -1312,9 +1373,10 @@ static int binder_release(struct inode *nodp, struct file *filp)
 	if (context_mgr_obj && context_mgr_obj->owner == proc->queue) 
 		context_mgr_obj = NULL;
 
-	// TODO: assume no more threads running
 	// TODO: make sure existing referencing context_mgr_obj is safe
-	binder_free_proc(proc);
+	// TODO: assume no more threads running
+
+	free_msg_queue(proc->queue);
 	return 0;
 }
 
@@ -1390,8 +1452,8 @@ static unsigned int binder_poll(struct file *filp, poll_table *p)
 	msg_queue_poll_wait_read(thread->queue, filp, p);
 
 	if (thread->last_error ||
-            !msg_queue_empty(thread->queue) ||
-            (!thread->pending_replies && msg_queue_size(proc->queue) > 0))
+	    !msg_queue_empty(thread->queue) ||
+	    (thread->pending_replies < 1 && msg_queue_size(proc->queue) > 0))
 		return POLLIN | POLLRDNORM;
 
 	// TODO: consider POLLOUT case as write can block too (not compat)
@@ -1406,6 +1468,273 @@ static int binder_flush(struct file *filp, fl_owner_t id)
 static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	return 0;	// compat
+}
+
+static int debugfs_proc_info(struct seq_file *seq, void *start)
+{	
+	struct debugfs_priv *priv = seq->private;
+	struct binder_proc *proc;
+
+	if (get_msg_queue(priv->owner) < 0)
+		return -ENODEV;
+
+	proc = priv->proc;
+
+	seq_printf(seq, "pid: %d\n", proc->pid);
+	seq_printf(seq, "queue: %p\n", proc->queue);
+	seq_printf(seq, "obj_seq: %lu\n", proc->obj_seq);
+	seq_printf(seq, "max_threads: %d\n", proc->max_threads);
+	seq_printf(seq, "num_loopers: %d\n", atomic_read(&proc->num_loopers));
+	seq_printf(seq, "busy_loopers: %d\n", atomic_read(&proc->busy_loopers));
+	seq_printf(seq, "requested_loopers: %d\n", atomic_read(&proc->requested_loopers));
+
+	put_msg_queue(priv->owner);
+	return 0;
+}
+
+static int debugfs_thread_info(struct seq_file *seq, void *start)
+{
+	struct debugfs_priv *priv = seq->private;
+	struct binder_proc *proc;
+	pid_t pid;
+	struct rb_node **p;
+	struct rb_node *parent = NULL;
+	struct binder_thread *thread;
+
+	if (get_msg_queue(priv->owner) < 0)
+		return -ENODEV;
+
+	proc = priv->proc;
+	pid = priv->data;
+	p = &proc->thread_tree.rb_node;
+
+	spin_lock(&proc->lock);
+	while (*p) {
+		parent = *p;
+		thread = rb_entry(parent, struct binder_thread, rb_node);
+
+		if (pid < thread->pid)
+			p = &(*p)->rb_left;
+		else if (pid > thread->pid)
+			p = &(*p)->rb_right;
+		else
+			goto seq_show;
+	}
+	spin_unlock(&proc->lock);
+
+	put_msg_queue(priv->owner);
+	return -ENODEV;
+	
+seq_show:
+	seq_printf(seq, "pid: %d\n", thread->pid);
+	seq_printf(seq, "queue: %p\n", thread->queue);
+	seq_printf(seq, "state: %d\n", thread->state);
+	seq_printf(seq, "non_block: %d\n", thread->non_block);
+	seq_printf(seq, "last_error: %x\n", thread->last_error);
+	seq_printf(seq, "pending_replies: %d\n", thread->pending_replies);
+	//TODO: show incoming_transactions
+
+	spin_unlock(&proc->lock);
+
+	put_msg_queue(priv->owner);
+	return 0;
+}
+
+static int debugfs_obj_info(struct seq_file *seq, void *start)
+{
+	struct debugfs_priv *priv = seq->private;
+	struct binder_proc *proc;
+	unsigned long ref;
+	struct binder_obj *obj;
+	struct hlist_head *head;
+	struct hlist_node *node;
+	int local;
+
+	if (get_msg_queue(priv->owner) < 0)
+		return -ENODEV;
+
+	proc = priv->proc;
+	ref = priv->data;
+
+	spin_lock(&proc->obj_lock);
+
+	head = &proc->obj_hash[ref % OBJ_HASH_BUCKET_SIZE];
+	hlist_for_each_entry(obj, node, head, hash_node) {
+		if (obj->ref == ref)
+			goto seq_show;
+	}
+
+	spin_unlock(&proc->obj_lock);
+
+	put_msg_queue(priv->owner);
+	return -ENODEV;
+
+seq_show:
+	local = (obj->owner == proc);
+
+	seq_printf(seq, "ref: %lu\n", obj->ref);
+	seq_printf(seq, "owner: %p (%c)\n", obj->owner, local ? 'l' : 'r');
+	seq_printf(seq, "type: %s\n", local ? "binder" : "handle");
+	if (local)
+		seq_printf(seq, "binder: %p\n", obj->binder);
+	else
+		seq_printf(seq, "handle: %u\n", (unsigned int)obj->binder);
+	seq_printf(seq, "cookie: %p\n", obj->cookie);
+	// TODO: show notifiers
+
+	spin_unlock(&proc->obj_lock);
+
+	put_msg_queue(priv->owner);
+	return 0;
+}
+
+static int debugfs_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, debugfs_proc_info, inode->i_private);
+}
+
+static int debugfs_thread_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, debugfs_thread_info, inode->i_private);
+}
+
+static int debugfs_obj_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, debugfs_obj_info, inode->i_private);
+}
+
+static int debugfs_release_private(struct inode *inode, struct file *file)
+{
+	struct seq_file *seq = file->private_data;
+
+	kfree(seq->private);
+	seq->private = NULL;
+	return single_release(inode, file);
+}
+
+static const struct file_operations debugfs_proc_fops = {
+	.owner		= THIS_MODULE,
+	.open		= debugfs_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= debugfs_release_private
+};
+
+static const struct file_operations debugfs_thread_fops = {
+	.owner		= THIS_MODULE,
+	.open		= debugfs_thread_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= debugfs_release_private
+};
+
+static const struct file_operations debugfs_obj_fops = {
+	.owner		= THIS_MODULE,
+	.open		= debugfs_obj_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= debugfs_release_private
+};
+
+static int debugfs_new_proc(struct binder_proc *proc)
+{
+	struct debugfs_priv *priv;
+	struct dentry *d;
+	char str[32];
+
+	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		goto no_mem;
+	priv->owner = proc->queue;
+	priv->proc = proc;
+
+	sprintf(str, "%d", proc->pid);
+	d = debugfs_create_file(str, S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
+				debugfs_root, proc, NULL);
+	if (!d)
+		goto no_proc;
+	proc->proc_dir = d;
+
+	d = debugfs_create_file("threads", S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
+				proc->proc_dir, proc, NULL);
+	if (!d)
+		goto no_threads;
+	proc->thread_dir = d;
+
+	d = debugfs_create_file("objs", S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
+				proc->proc_dir, proc, NULL);
+
+	if (!d)
+		goto no_objs;
+	proc->obj_dir = d;
+
+	d = debugfs_create_file("info", S_IRUGO, proc->proc_dir, priv, &debugfs_proc_fops);
+	if (!d)
+		goto no_info;
+
+	return 0;
+
+no_info:
+	debugfs_remove(proc->obj_dir);
+no_objs:
+	debugfs_remove(proc->thread_dir);
+no_threads:
+	debugfs_remove(proc->proc_dir);
+no_proc:
+	kfree(priv);
+no_mem:
+	return -ENODEV;
+}
+
+static int debugfs_new_thread(struct binder_proc *proc, struct binder_thread *thread)
+{
+	struct debugfs_priv *priv;
+	char str[32];
+
+	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->owner = proc->queue;
+	priv->proc = proc;
+	priv->data = (unsigned long)thread->pid;
+
+	sprintf(str, "%d", thread->pid);
+	thread->info_node = debugfs_create_file(str, S_IRUGO, proc->thread_dir, priv, &debugfs_thread_fops);
+	if (!thread->info_node)
+		return -ENODEV;
+
+	return 0;
+}
+
+static int debugfs_new_obj(struct binder_proc *proc, struct binder_obj *obj)
+{
+	struct debugfs_priv *priv;
+	char str[32];
+
+	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->owner = proc->queue;
+	priv->proc = proc;
+	priv->data = obj->ref;
+
+	sprintf(str, "%lu", obj->ref);
+	obj->info_node = debugfs_create_file(str, S_IRUGO, proc->obj_dir, priv, &debugfs_obj_fops);
+	if (!obj->info_node)
+		return -ENODEV;
+
+	return 0;
+}
+
+static int __init binder_debugfs_init(void)
+{
+	debugfs_root = debugfs_create_dir("binder", NULL);
+
+	if (!debugfs_root) 
+		return -ENODEV;
+	return 0;
 }
 
 static const struct file_operations binder_fops = {
@@ -1431,12 +1760,19 @@ static int __init binder_init(void)
 	r = misc_register(&binder_miscdev);
 	if (r < 0)
 		return r;
+
+	r = binder_debugfs_init();
+	if (r < 0)
+		return r;
+
 	return 0;
 }
 
 static void __exit binder_exit(void)
 {
 	misc_deregister(&binder_miscdev);
+
+	debugfs_remove(debugfs_root);
 }
 
 module_init(binder_init);

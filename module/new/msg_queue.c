@@ -61,7 +61,7 @@ static inline int rb_queue_exist(struct msg_queue *q)
 	return 0;
 }
 
-struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler)
+struct msg_queue *create_msg_queue(size_t max_msgs, queue_release_handler handler, void *data)
 {
 	struct msg_queue *q;
 
@@ -77,9 +77,10 @@ struct msg_queue *create_msg_queue(size_t max_msgs, msg_release_handler handler)
 	init_waitqueue_head(&q->rd_wait);
 	init_waitqueue_head(&q->wr_wait);
 
-	q->release = handler;
 	q->active = 1;
 	q->usage = 1;
+	q->release = handler;
+	q->private = data;
 
 	spin_lock(&g_queue_lock);
 	rb_insert_queue(&q->rb_node);
@@ -119,16 +120,10 @@ int put_msg_queue(struct msg_queue *q)
 	rb_erase(&q->rb_node, &g_queue_tree);
 	spin_unlock(&g_queue_lock);
 
-	if (q->release) {
-		struct list_head *entry, *next;
-
-		list_for_each_safe(entry, next, &q->msgs) {
-			list_del(entry);
-			q->release(entry);
-		}
-	}
-
 	BUG_ON(waitqueue_active(&q->rd_wait) || waitqueue_active(&q->wr_wait));
+
+	if (q->release)
+		q->release(q, q->private);
 	kfree(q);
 
 	return 1;
