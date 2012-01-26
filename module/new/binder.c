@@ -1603,7 +1603,7 @@ static int debugfs_obj_info(struct seq_file *seq, void *start)
 	return -ENODEV;
 
 seq_show:
-	local = (obj->owner == proc);
+	local = (obj->owner == proc->queue);
 
 	seq_printf(seq, "ref: %lu\n", obj->ref);
 	seq_printf(seq, "owner: %p (%c)\n", obj->owner, local ? 'l' : 'r');
