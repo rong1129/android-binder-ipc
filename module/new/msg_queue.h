@@ -64,6 +64,25 @@ extern int write_msg_queue_head(struct msg_queue *q, struct list_head *msg);
 extern int read_msg_queue(struct msg_queue *q, struct list_head **pmsg);
 extern int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg);
 
+
+/* Following inline functions should be called either by the queue owner or
+ * with a reference held via a call to get_msg_queue() previously
+ */
+static inline void enable_msg_queue(struct msg_queue *q)
+{
+	q->active = 1;
+}
+
+static inline void disable_msg_queue(struct msg_queue *q)
+{
+	q->active = 0;
+}
+
+static inline int msg_queue_active(struct msg_queue *q)
+{
+	return (q->active > 0);
+}
+
 static inline int msg_queue_empty(struct msg_queue *q)
 {
 	return (q->num_msgs < 1);
