@@ -5,7 +5,9 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <sys/wait.h>
+
 
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
@@ -31,11 +33,7 @@ typedef struct {
 } bcmd_txn_t;
 
 typedef union {
-	struct {
-		uint32_t secs;
-		uint32_t usecs;
-	};
-
+	struct timeval tv;
 	char label[8];
 } inst_entry_t;
 
@@ -50,6 +48,9 @@ typedef struct {
 uint16_t svcmgr_id[] = { 'a','n','d','r','o','i','d','.','o','s','.',
 			 'I','S','e','r','v','i','c','e','M','a','n','a','g','e','r' };
 static uint16_t service[] = { 'i', 'n', 's', 't' };
+
+static int iterations = 1;
+static char *output_file;
 
 
 void hexdump(const void *buf, unsigned long size)
@@ -92,17 +93,14 @@ inline void INST_START(inst_buf_t *inst)
 
 inline void INST_RECORD(inst_entry_t *entry)
 {
-	// TODO: get time
-	entry->secs = 0;
-	entry->usecs = 0;
+	gettimeofday(&entry->tv, NULL);
 }
 
 inline void INST_ENTRY(inst_buf_t *inst, char *label)
 {
-	// TODO: get time
 	inst_entry_t copy;
-	copy.secs = 0;
-	copy.usecs = 0;
+
+	gettimeofday(&copy.tv, NULL);
 
 	if (inst->next_entry < inst->max_entries) {
 		inst_entry_t *entry = inst->entries + inst->next_entry++;
@@ -160,6 +158,23 @@ int parse_command(void *buf, unsigned long size, bcmd_txn_t **reply)
 				break;
 
 			case BR_TRANSACTION:
+				fprintf(stderr, "rcv transaction\n");
+				if (p + sizeof(*tdata) > ep) {
+					fprintf(stderr, "not enough transaction data\n");
+					return -1;
+				}
+
+				tdata = (tdata_t *)p;
+
+				p += sizeof(*tdata);
+				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
+				if (p + buffer_size > ep) {
+					fprintf(stderr, "not enough transaction data buffer\n");
+					return -1;
+				}
+				p += buffer_size;
+				break;
+
 			case BR_REPLY:
 				if (p + sizeof(*tdata) > ep) {
 					fprintf(stderr, "not enough transaction data\n");
@@ -207,20 +222,17 @@ expected_out:
 	return p - (unsigned char *)buf;
 }
 
-int simple_transact(int fd, bcmd_txn_t *txn_in, bcmd_txn_t **reply, unsigned char *buf, unsigned int size)
+int simple_transact(int fd, bcmd_txn_t *txn, bcmd_txn_t **preply, unsigned char *buf, unsigned int size)
 {
 	bwr_t bwr;
-	bcmd_txn_t *txn = NULL;
-	int r;
+	bcmd_txn_t *reply = NULL;
+	int r, retries = 2;
 
-	//hexdump(txn_in, sizeof(*txn_in));
-	//hexdump(txn_in->tdata.data.ptr.buffer, txn_in->tdata.data_size);
-	//hexdump(txn_in->tdata.data.ptr.offsets, txn_in->tdata.offsets_size);
-
-	bwr.write_buffer = (unsigned long)txn_in;
-	bwr.write_size = sizeof(*txn_in);
+	bwr.write_buffer = (unsigned long)txn;
+	bwr.write_size = sizeof(*txn);
 	bwr.write_consumed = 0;
 
+wait_reply:
 	bwr.read_buffer = (unsigned long)buf;
 	bwr.read_size = size;
 	bwr.read_consumed = 0;
@@ -230,25 +242,23 @@ int simple_transact(int fd, bcmd_txn_t *txn_in, bcmd_txn_t **reply, unsigned cha
 		return r;
 
 	if (bwr.read_consumed > 0) {
-		//hexdump(buf, bwr.read_consumed);
-
-		r = parse_command(buf, bwr.read_consumed, &txn);
+		r = parse_command(buf, bwr.read_consumed, &reply);
 		if (r < 0)
 			return r;
 	}
 
-	if (!txn) {
-		fprintf(stderr, "no reply received");
+	if (reply) {
+		*preply = reply;
+		return 0;
+	}
+
+	if (retries-- <= 0) {
+		fprintf(stderr, "no reply received\n");
 		return -1;
 	}
 
-	if (txn->cmd != BR_REPLY) {
-		fprintf(stderr, "transaction received instead of reply");
-		return -1;
-	}
-
-	*reply = txn;
-	return 0;
+	bwr.write_size = 0;
+	goto wait_reply;
 }
 
 bcmd_txn_t *create_transaction(int reply,
@@ -349,7 +359,7 @@ int add_service(int fd, void *binder, void *cookie, uint16_t *name, int len)
 	txn = create_transaction(0, NULL, NULL, 3, buf, p - buf, (unsigned char *)offsets, 4);
 	if (!txn)
 		return -1;
-	
+
 	r = simple_transact(fd, txn, &reply, buf, sizeof(buf));
 	if (r < 0)
 		return r;
@@ -396,19 +406,19 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 	p += 2;
 	p = (unsigned char *)ALIGN((unsigned long)p);
 
-	txn = create_transaction(0, NULL, NULL, 1, NULL, 0, NULL, 0);
+	txn = create_transaction(0, NULL, NULL, 1, buf, p - buf, NULL, 0);
 	if (!txn)
 		return -1;
-	
+
 	r = simple_transact(fd, txn, &reply, buf, sizeof(buf));
 	if (r < 0)
 		return r;
 
 	tdata = &reply->tdata;
 	if (tdata->data_size == 4 && *(unsigned int *)tdata->data.ptr.buffer)
-		return 0;
+		return 0;	// server not ready
 
-	if (tdata->data_size != 4 + sizeof(*obj) || tdata->offsets_size != 4 || *(unsigned int *)tdata->data.ptr.buffer) {
+	if (tdata->data_size != sizeof(*obj) || tdata->offsets_size != 4) {
 		fprintf(stderr, "invalid reply data received\n");
 		return -1;
 	}
@@ -421,10 +431,10 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 	*cookie = obj->cookie;
 
 	free(txn);
-	return 0;
+	return 1;
 }
 
-int server_parse_command(unsigned char *buf, unsigned long size, bcmd_txn_t **txn_out)
+int server_parse_command(unsigned char *buf, long *psize, bcmd_txn_t **txn_out)
 {
 	unsigned char *p, *ep;
 	unsigned int cmd;
@@ -433,7 +443,7 @@ int server_parse_command(unsigned char *buf, unsigned long size, bcmd_txn_t **tx
 	unsigned long buffer_size;
 
 	p = buf;
-	ep = p + size;
+	ep = p + *psize;
 	while (p < ep) {
 		cmd = *(unsigned int *)p;
 		p += sizeof(cmd);
@@ -525,19 +535,17 @@ int server_parse_command(unsigned char *buf, unsigned long size, bcmd_txn_t **tx
 	}
 
 expected_out:
-	if (p != ep)
-		fprintf(stderr, "server read buffer has unexpected data\n");
-
+	*psize -= (p - buf);
 	*txn_out = txn;
 	return 0;
 }
 
-int server(void)
+int server_main(void)
 {
 	int fd, r;
 	void *binder, *cookie;
 	bwr_t bwr;
-	unsigned char buf[4096];
+	unsigned char rbuf[4096];
 	bcmd_txn_t *txn;
 	inst_buf_t *inst;
 	inst_entry_t entry;
@@ -558,13 +566,12 @@ int server(void)
 	}
 	printf("server added instrumenting service\n");
 
-	bwr.read_buffer = (unsigned long)buf;
+	bwr.read_buffer = (unsigned long)rbuf;
 
 	while (1) {
-		bwr.read_size = sizeof(buf);
+		bwr.read_size = sizeof(rbuf);
 		bwr.read_consumed = 0;
 		bwr.write_size = 0;
-		bwr.write_consumed = 0;
 
 		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 		if (r < 0) {
@@ -573,11 +580,14 @@ int server(void)
 		}
 		INST_RECORD(&entry);
 
-		if (bwr.read_consumed > 0) {
-			r = server_parse_command(buf, bwr.read_consumed, &txn);
-			if (r < 0 || !txn)
+		while (bwr.read_consumed > 0) {
+			r = server_parse_command(rbuf, &bwr.read_consumed, &txn);
+			if (r < 0)
 				return r;
+			if (!txn)
+				continue;
 
+			txn->cmd = BC_REPLY;
 			inst = (inst_buf_t *)txn->tdata.data.ptr.buffer;
 			INST_ENTRY_COPY(inst, "S_RECV", &entry);
 
@@ -585,7 +595,6 @@ int server(void)
 			bwr.write_size = sizeof(*txn);
 			bwr.write_consumed = 0;
 			bwr.read_size = 0;
-			bwr.read_consumed = 0;
 
 			INST_ENTRY(inst, "S_REPLY");
 
@@ -601,11 +610,12 @@ int server(void)
 	return 0;
 }
 
-int client_parse_command(int id, unsigned char *buf, unsigned long size, bcmd_txn_t *txn)
+int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_buf_t **pinst)
 {
 	unsigned char *p, *ep;
 	unsigned int cmd;
 	tdata_t *tdata;
+	inst_buf_t *inst = NULL;
 	unsigned long buffer_size;
 
 	p = buf;
@@ -672,8 +682,12 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, bcmd_tx
 					fprintf(stderr, "client %d: data size in reply is incorrect\n", id);
 					return -1;
 				}
-				memcpy((unsigned char *)txn->tdata.data.ptr.buffer, (unsigned char *)tdata->data.ptr.buffer, tdata->data_size);
-				goto expected_out;
+				if (inst) {
+					fprintf(stderr, "client %d: received multiple reply\n", id);
+					return -1;
+				}
+				inst = (inst_buf_t *)tdata->data.ptr.buffer;
+				break;
 
 			case BR_DEAD_BINDER:
 				fprintf(stderr, "client %d received unexpected dead_binder command\n", id);
@@ -699,22 +713,23 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, bcmd_tx
 		}
 	}
 
-expected_out:
-	if (p != ep)
-		fprintf(stderr, "client %d read buffer has unexpected data\n", id);
+	if (p != ep) {
+		fprintf(stderr, "client %d receiver buffer has unknown data\n", id);
+		return -1;
+	}
+
 	return 0;
 }
 
-int client(int id, int iterations)
+int client_main(int id)
 {
-	int fd, r, n, m;
+	int fd, r, n, m, wait = 0, retries;
 	void *binder, *cookie;
 	bcmd_txn_t *txn;
 	bwr_t bwr;
 	inst_buf_t *inst;
-	inst_entry_t *entry;
+	inst_entry_t *entry, copy;
 	unsigned char rbuf[4096], *ibuf, *p;
-	char file[64];
 	FILE *fp;
 
 	fd = open("/dev/binder", O_RDWR);
@@ -731,7 +746,8 @@ int client(int id, int iterations)
 		} else if (r > 0)
 			break;
 
-		fprintf(stderr, "client %d waiting on the instrumenting service to be ready\n", id);
+		if (wait++ > 1)
+			fprintf(stderr, "client %d still waiting on instrumenting service to be ready\n", id);
 		sleep(1);
 	}
 	printf("client %d found instrumenting service\n", id);
@@ -748,13 +764,12 @@ int client(int id, int iterations)
 	inst = (inst_buf_t *)txn->tdata.data.ptr.buffer;
 	INST_INIT(inst);
 
-	iterations++;
-	ibuf = malloc(iterations * sizeof(inst_entry_t) * INSTRUCTING_MAX_ENTRIES);
+	ibuf = malloc((iterations + 1) * sizeof(inst_entry_t) * INSTRUCTING_MAX_ENTRIES);
 	if (!ibuf)
 		fprintf(stderr, "client %d failed to allocate instrumenting buffer\n", id);
 
 	p = ibuf;
-	n = iterations;
+	n = iterations + 1;
 	while (n-- > 0) {
 		INST_START(inst);
 
@@ -763,66 +778,80 @@ int client(int id, int iterations)
 		bwr.read_size = sizeof(rbuf);
 		bwr.read_consumed = 0;
 
+		retries = 2;
+
 		INST_ENTRY(inst, "C_IO_IN");
 
+wait_reply:
 		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 		if (r < 0) {
 			fprintf(stderr, "client %d failed ioctl\n", id);
 			return r;
 		}
+		INST_RECORD(&copy);
 
-		INST_ENTRY(inst, "C_IO_OUT");
-
-		r = client_parse_command(id, rbuf, bwr.read_consumed, txn);
+		r = client_parse_command(id, rbuf, bwr.read_consumed, &inst);
 		if (r < 0)
 			return r;
 
+		if (!inst) {
+			if (retries-- > 0) {
+				bwr.write_size = 0;
+				bwr.read_consumed = 0;
+				goto wait_reply;
+			} else {
+				fprintf(stderr, "client %d failed to receive reply\n", id);
+				return -1;
+			}
+		}
+
+		INST_ENTRY_COPY(inst, "C_IO_OUT", &copy);
 		INST_ENTRY(inst, "C_EXIT");
 
 		INST_END(inst, p);
 		p += sizeof(inst_entry_t) * INSTRUCTING_MAX_ENTRIES;
 	}
 
-	sprintf(file, "cli-%d.dump", id);
-	fp = fopen(file, "r");
-	if (!fp) {
-		fprintf(stderr, "client %d failed to dump results\n", id);
-		return -1;
-	}
+	if (output_file) {
+		fp = fopen(output_file, "w");
+		if (!fp) {
+			fprintf(stderr, "client %d failed to open dump file\n", id);
+			return -1;
+		}
+	} else
+		fp = stdout;
 
 	entry = (inst_entry_t *)ibuf;
 	for (n = 0; n < inst->seq; n++) {
 		for (m = 0; m < inst->next_entry; m++) {
 			if (n)
-				fprintf(fp, "%u.%u", entry->secs, entry->usecs);
+				fprintf(fp, "%ld.%ld, ", entry->tv.tv_sec, entry->tv.tv_usec);
 			else
-				fprintf(fp, "%s,", entry->label);
+				fprintf(fp, "%s, ", entry->label);
 
 			entry++;
 		}
 		fprintf(fp, "\n");
 	}
 
-	fclose(fp);
+	if (fp != stdout)
+		fclose(fp);
 	free(txn);
 
-	printf("client %d completed\n", id);
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	int clients, iterations, i, r, stat;
+	int clients, i, r, stat;
 	pid_t pid;
 
 	clients = 1;
-	iterations = 10000;
-
 	for (i = 0; i < clients; i++) {
 		pid = fork();
 
 		if (!pid) {
-			client(i, iterations);
+			client_main(i);
 			exit(0);
 		} else if (pid < 0) {
 			fprintf(stderr, "server fork error\n");
@@ -830,7 +859,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	server();
+	server_main();
 
 	while (clients-- > 0) {
 		r = wait(&stat);
