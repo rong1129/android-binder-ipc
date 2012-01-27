@@ -1581,7 +1581,6 @@ static int debugfs_obj_info(struct seq_file *seq, void *start)
 	struct binder_obj *obj;
 	struct hlist_head *head;
 	struct hlist_node *node;
-	int local;
 
 	if (get_msg_queue(priv->owner) < 0)
 		return -ENODEV;
@@ -1603,15 +1602,10 @@ static int debugfs_obj_info(struct seq_file *seq, void *start)
 	return -ENODEV;
 
 seq_show:
-	local = (obj->owner == proc->queue);
-
 	seq_printf(seq, "ref: %lu\n", obj->ref);
-	seq_printf(seq, "owner: %p (%c)\n", obj->owner, local ? 'l' : 'r');
-	seq_printf(seq, "type: %s\n", local ? "binder" : "handle");
-	if (local)
-		seq_printf(seq, "binder: %p\n", obj->binder);
-	else
-		seq_printf(seq, "handle: %u\n", (unsigned int)obj->binder);
+	seq_printf(seq, "type: %s\n", (obj->owner == proc->queue) ? "binder" : "handle");
+	seq_printf(seq, "owner: %p\n", obj->owner);
+	seq_printf(seq, "binder: %p\n", obj->binder);
 	seq_printf(seq, "cookie: %p\n", obj->cookie);
 	// TODO: show notifiers
 
