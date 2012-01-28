@@ -7,6 +7,7 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 
 typedef unsigned char uint8_t;
@@ -15,7 +16,7 @@ typedef unsigned int uint32_t;
 #include "binder.h"
 
 
-#define INSTRUCTING_MAX_ENTRIES		32
+#define INSTRUCTING_MAX_ENTRIES		16
 
 #define SVC_BINDER			(void *)0x696e7374
 #define SVC_COOKIE			(void *)~((unsigned long)SVC_BINDER)
@@ -49,7 +50,9 @@ uint16_t svcmgr_id[] = { 'a','n','d','r','o','i','d','.','o','s','.',
 			 'I','S','e','r','v','i','c','e','M','a','n','a','g','e','r' };
 static uint16_t service[] = { 'i', 'n', 's', 't' };
 
-static int iterations = 1;
+static int clients = 1;
+static int time_ref = 1;
+static int iterations = 1000;
 static char *output_file;
 
 
@@ -96,34 +99,36 @@ inline void INST_RECORD(inst_entry_t *entry)
 	gettimeofday(&entry->tv, NULL);
 }
 
-inline void INST_ENTRY(inst_buf_t *inst, char *label)
-{
-	inst_entry_t copy;
-
-	gettimeofday(&copy.tv, NULL);
-
-	if (inst->next_entry < inst->max_entries) {
-		inst_entry_t *entry = inst->entries + inst->next_entry++;
-
-		if (inst->seq)
-			*entry = copy;
-		else
-			strncpy(entry->label, label, 8);
-	}
-}
-
 inline void INST_ENTRY_COPY(inst_buf_t *inst, char *label, inst_entry_t *copy)
 {
 	if (inst->next_entry < inst->max_entries) {
 		inst_entry_t *entry = inst->entries + inst->next_entry++;
 
-		*entry = *copy;
+		if (inst->seq)
+			*entry = *copy;
+		else {
+			strncpy(entry->label, label, 8);
+			entry->label[7] = '\0';
+		}
 	}
 }
 
-inline void INST_END(inst_buf_t *inst, unsigned char *buf)
+inline void INST_ENTRY(inst_buf_t *inst, char *label)
 {
-	memcpy(buf, inst->entries, inst->next_entry * 8);
+	inst_entry_t copy;
+
+	gettimeofday(&copy.tv, NULL);
+	INST_ENTRY_COPY(inst, label, &copy);
+}
+
+inline void INST_END(inst_buf_t *inst, unsigned char **buf)
+{
+	if (buf) {
+		int size = inst->next_entry * sizeof(inst_entry_t);
+
+		memcpy(*buf, inst->entries, size);
+		*buf += size;
+	}
 	inst->seq++;
 }
 
@@ -434,7 +439,7 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 	return 1;
 }
 
-int server_parse_command(unsigned char *buf, long *psize, bcmd_txn_t **txn_out)
+int server_parse_command(unsigned char *buf, long size, bcmd_txn_t **txn_out)
 {
 	unsigned char *p, *ep;
 	unsigned int cmd;
@@ -443,7 +448,7 @@ int server_parse_command(unsigned char *buf, long *psize, bcmd_txn_t **txn_out)
 	unsigned long buffer_size;
 
 	p = buf;
-	ep = p + *psize;
+	ep = p + size;
 	while (p < ep) {
 		cmd = *(unsigned int *)p;
 		p += sizeof(cmd);
@@ -535,20 +540,19 @@ int server_parse_command(unsigned char *buf, long *psize, bcmd_txn_t **txn_out)
 	}
 
 expected_out:
-	*psize -= (p - buf);
 	*txn_out = txn;
-	return 0;
+	return (p - buf);
 }
 
 int server_main(void)
 {
-	int fd, r;
+	int fd, r, len;
 	void *binder, *cookie;
 	bwr_t bwr;
-	unsigned char rbuf[4096];
+	unsigned char rbuf[4096], *p;
 	bcmd_txn_t *txn;
 	inst_buf_t *inst;
-	inst_entry_t entry;
+	inst_entry_t copy;
 
 	fd = open("/dev/binder", O_RDWR);
 	if (fd < 0) {
@@ -578,18 +582,24 @@ int server_main(void)
 			fprintf(stderr, "server failed ioctl\n");
 			return r;
 		}
-		INST_RECORD(&entry);
+		INST_RECORD(&copy);
 
-		while (bwr.read_consumed > 0) {
-			r = server_parse_command(rbuf, &bwr.read_consumed, &txn);
+		p = rbuf;
+		len = bwr.read_consumed;
+		while (len > 0) {
+			r = server_parse_command(p, len, &txn);
 			if (r < 0)
 				return r;
+
+			p += r;
+			len -= r;
+
 			if (!txn)
 				continue;
 
 			txn->cmd = BC_REPLY;
 			inst = (inst_buf_t *)txn->tdata.data.ptr.buffer;
-			INST_ENTRY_COPY(inst, "S_RECV", &entry);
+			INST_ENTRY_COPY(inst, "S_RECV", &copy);
 
 			bwr.write_buffer = (unsigned long)txn;
 			bwr.write_size = sizeof(*txn);
@@ -718,6 +728,7 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 		return -1;
 	}
 
+	*pinst = inst;
 	return 0;
 }
 
@@ -727,9 +738,10 @@ int client_main(int id)
 	void *binder, *cookie;
 	bcmd_txn_t *txn;
 	bwr_t bwr;
-	inst_buf_t *inst;
+	inst_buf_t *inst, *inst_reply;
 	inst_entry_t *entry, copy;
 	unsigned char rbuf[4096], *ibuf, *p;
+	struct timeval ref, delta;
 	FILE *fp;
 
 	fd = open("/dev/binder", O_RDWR);
@@ -773,14 +785,14 @@ int client_main(int id)
 	while (n-- > 0) {
 		INST_START(inst);
 
+		retries = 2;
+
 		bwr.write_size = sizeof(*txn);
 		bwr.write_consumed = 0;
 		bwr.read_size = sizeof(rbuf);
 		bwr.read_consumed = 0;
 
-		retries = 2;
-
-		INST_ENTRY(inst, "C_IO_IN");
+		INST_ENTRY(inst, "C_SEND");
 
 wait_reply:
 		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
@@ -790,11 +802,11 @@ wait_reply:
 		}
 		INST_RECORD(&copy);
 
-		r = client_parse_command(id, rbuf, bwr.read_consumed, &inst);
+		r = client_parse_command(id, rbuf, bwr.read_consumed, &inst_reply);
 		if (r < 0)
 			return r;
 
-		if (!inst) {
+		if (!inst_reply) {
 			if (retries-- > 0) {
 				bwr.write_size = 0;
 				bwr.read_consumed = 0;
@@ -805,14 +817,25 @@ wait_reply:
 			}
 		}
 
-		INST_ENTRY_COPY(inst, "C_IO_OUT", &copy);
-		INST_ENTRY(inst, "C_EXIT");
+		INST_ENTRY_COPY(inst_reply, "C_RECV", &copy);
+		INST_ENTRY(inst_reply, "C_EXIT");
 
-		INST_END(inst, p);
-		p += sizeof(inst_entry_t) * INSTRUCTING_MAX_ENTRIES;
+		INST_END(inst_reply, &p);
+		INST_END(inst, NULL);
 	}
 
 	if (output_file) {
+		if (clients > 1) {
+			char *p = malloc(strlen(output_file) + 16);
+
+			if (!p) {
+				fprintf(stderr, "client %d failed to alloc memory for filename\n", id);
+				return -1;
+			}
+			sprintf(p, "%s-%d", output_file, id);
+			output_file = p;
+		}
+
 		fp = fopen(output_file, "w");
 		if (!fp) {
 			fprintf(stderr, "client %d failed to open dump file\n", id);
@@ -822,12 +845,29 @@ wait_reply:
 		fp = stdout;
 
 	entry = (inst_entry_t *)ibuf;
-	for (n = 0; n < inst->seq; n++) {
-		for (m = 0; m < inst->next_entry; m++) {
-			if (n)
-				fprintf(fp, "%ld.%ld, ", entry->tv.tv_sec, entry->tv.tv_usec);
-			else
-				fprintf(fp, "%s, ", entry->label);
+	for (n = 0; n < inst_reply->seq; n++) {
+		for (m = 0; m < inst_reply->next_entry; m++) {
+			if (n > 0) {
+				if (m == 0) {
+					if (time_ref == 0)	// absolute time
+						ref.tv_sec = ref.tv_usec = 0;
+					else 
+						ref = entry->tv;
+				}
+
+				delta.tv_sec = entry->tv.tv_sec - ref.tv_sec;
+				delta.tv_usec = entry->tv.tv_usec - ref.tv_usec;
+				if (delta.tv_usec < 0) {
+					delta.tv_sec--;
+					delta.tv_usec += 1000000;
+				}
+
+				fprintf(fp, "%ld.%06ld\t", delta.tv_sec, delta.tv_usec);
+
+				if (time_ref > 1)	// relative to the previous entry
+					ref = entry->tv;
+			} else
+				fprintf(fp, "%8s\t", entry->label);
 
 			entry++;
 		}
@@ -841,12 +881,53 @@ wait_reply:
 	return 0;
 }
 
+void children_reaper(int sig)
+{
+	pid_t pid;
+	int stat;
+
+	do {
+		pid = waitpid((pid_t)-1, &stat, WNOHANG | WUNTRACED);
+	} while (pid > 0);
+
+	if (pid < 0)	// no more children
+		exit(0);
+}
+
 int main(int argc, char **argv)
 {
-	int clients, i, r, stat;
+	int i, c;
 	pid_t pid;
 
-	clients = 1;
+	while ((c = getopt(argc, argv, "hc:n:o:t:")) != -1) {
+		switch (c) {
+			case 'c':
+				clients = atoi(optarg);
+				if (clients < 1)
+					clients = 1;
+				break;
+			case 'n':
+				iterations = atoi(optarg);
+				if (iterations < 1)
+					iterations = 1;
+				break;
+			case 'o':
+				output_file = strdup(optarg);
+				break;
+			case 't':
+				time_ref = atoi(optarg);
+				if (time_ref < 0 || time_ref > 2)
+					time_ref = 1;
+				break;
+			default:
+				fprintf(stderr, "Usage: binder_test [-c <clients>]\n"
+						"                   [-n <iterations>]\n"
+						"                   [-o <output file>]\n"
+						"                   [-t <0: absolute | 1: relative-to-first | 2: relative-to-previous]\n");
+				exit(1);
+		}
+	}
+
 	for (i = 0; i < clients; i++) {
 		pid = fork();
 
@@ -859,15 +940,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	signal(SIGCHLD, children_reaper);
 	server_main();
-
-	while (clients-- > 0) {
-		r = wait(&stat);
-		if (r == -1 && errno == ECHILD) {
-			fprintf(stderr, "no more clients to wait\n");
-			break;
-		}
-	}
-
 	return 0;
 }
