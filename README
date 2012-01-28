@@ -17,9 +17,10 @@ client ioctl (to read reply)                          -- user to kernel switch
 client blocked on waiting on reply                    -- task switch/wakeup
 server binder_thread_read (K_DEQ)
 
-Other timestamps sugggest a kernel-to-user or user-to-kernel context switch takes about 1us, that leaves about 6us spent on a task switch / waking up. The reason I'm using waking up, because on SMP (which I'm using), switching task could simply mean waking up the ready task on another CPU. Although it's not alway the case, as the scheduler considers other factors, such as cache pollution, in order to schedule a task onto a different CPU. 
+Other timestamps sugggest a kernel-to-user or user-to-kernel context switch takes about 1us, that leaves about 6us spent on a task switch / waking up. The reason I'm using waking up, because on SMP (which I'm using), switching task could simply mean waking up the ready task on another CPU. Although it's not alway the case, as the scheduler considers other factors, such as cache pollution, in order to schedule a task onto a different CPU.  To further complicate the matter, I'm using BFS for the scheduler, the 3.1.6 vinilla schedule behaves about 20-30% worse.
 
-To further complicate the matter, I'm using BFS for the scheduler, the 3.1.6 vinilla schedule behaves about 20-30% worse.
+Another thing that the above results sugggest is the framework based test app binderAddInts can't be used to test the performance of the driver as the time spending in the driver (~20-25us) is just a fraction of the total time spent for a binderAddInts two-way message. It also proves at least the extra memory copying I added in the new driver didn't or couldn't do anyting bad except just simplying the driver logic.
+
  
 
 
