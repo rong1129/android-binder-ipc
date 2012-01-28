@@ -1,3 +1,22 @@
+
+28 Jan 2010
+The test program binder_test works like a charm. It timestamps a transaction-reply roundtrip time, plus all the critical points the data goes through. Example shown below:
+
+  C_SEND	   K_IOC	 K_WR_IN	   K_ENQ	   K_DEQ	  K_COPY	  S_RECV	 S_REPLY	   K_IOC	 K_WR_IN	   K_ENQ	   K_DEQ	  K_COPY	  C_RECV	  C_EXIT	
+0.000000	0.000001	0.000002	0.000004	0.000012	0.000013	0.000014	0.000016	0.000017	0.000018	0.000019	0.000028	0.000030	0.000031	0.000033	
+0.000000	0.000002	0.000003	0.000004	0.000012	0.000013	0.000015	0.000016	0.000017	0.000018	0.000019	0.000028	0.000030	0.000031	0.000033	
+0.000000	0.000002	0.000003	0.000004	0.000012	0.000013	0.000014	0.000016	0.000017	0.000018	0.000019	0.000028	0.000030	0.000031	0.000032	
+
+The test shows that with a simple C implementation of server and client, a two-way transaction round trip time is about 33us, comparing to 150us-300us I have seen with binderAddInts, which was implemented op top of the framework. Obviously the framework wasn't implemented that efficiently.
+
+
+
+
+
+
+
+
+
 !!! Tested only on x86 32bit only (for now) - I'm using Ubuntu 10.04
 
 To Build:
