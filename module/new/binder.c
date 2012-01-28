@@ -25,11 +25,12 @@
 #include <linux/rbtree.h>
 #include <linux/poll.h>
 #include <linux/spinlock.h>
-#include <linux/atomic.h>
 #include <linux/uaccess.h>
 #include <linux/miscdevice.h>
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
+
+#include <asm/atomic.h>
 
 #include "msg_queue.h"
 #include "binder.h"
@@ -1192,7 +1193,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		uint32_t cmd = BR_CLEAR_DEATH_NOTIFICATION_DONE;
 		int found = 0;
 
-		if (size < sizeof(cmd))
+		if (size < sizeof(cmd) * 2)
 			return -ENOSPC;
 
 		spin_lock(&obj->lock);
@@ -1209,10 +1210,11 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 
 		if (found) {
 			kfree(notifier);
-			if (put_user(cmd, (uint32_t *)buf))
+			if (put_user(cmd, (uint32_t *)buf) || 
+			    put_user((uint32_t)msg->cookie, (uint32_t *)((unsigned char *)buf + sizeof(cmd))))
 				return -EFAULT;
 			else
-				r = sizeof(cmd);
+				r = sizeof(cmd) * 2;
 		}
 	}
 
@@ -1298,9 +1300,10 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 
 static long binder_thread_read(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
 {
-	struct bcmd_msg *msg = NULL;
 	struct msg_queue *q;
+	struct bcmd_msg *msg = NULL;
 	void __user *p = buf;
+	int force_return = 0;
 	long n;
 
 	if (thread->last_error) {
@@ -1309,20 +1312,17 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 				return -EFAULT;
 			thread->last_error = 0;
 			p += sizeof(uint32_t);
-			size -= n;
 		}
+		return p - buf;	// error returned immediately
 	}
 
 	n = bcmd_spawn_on_busy(proc, p, size);
-	if (n > 0) {
-		p += n;
-		size -= n;
-	} else if (n < 0)
+	if (n)	// spawn or error returned immediately
 		return n;
 
 	atomic_inc(&proc->busy_loopers);
 
-	while (size >= sizeof(uint32_t)) {
+	while (size >= sizeof(uint32_t) && !force_return) {
 		if (thread->pending_replies > 0 || !msg_queue_empty(thread->queue))
 			q = thread->queue;
 		else
@@ -1340,6 +1340,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			case BC_TRANSACTION:
 			case BC_REPLY:
 				n = bcmd_read_transaction(proc, thread, &msg, p, size);
+				force_return = 1;
 				break;
 
 			case BR_TRANSACTION_COMPLETE:
@@ -1348,11 +1349,14 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 
 			case BR_DEAD_BINDER:
 				n = bcmd_read_dead_binder(proc, thread, &msg, p, size);
+				force_return = 1;
 				break;
 
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION:
 				n = bcmd_read_notifier(proc, thread, &msg, p, size);
+				if (n > 0)
+					force_return = 1;
 				break;
 
 			// Hack/TODO

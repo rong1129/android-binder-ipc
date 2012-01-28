@@ -56,6 +56,7 @@ static int clients = 1;
 static int time_ref = 1;
 static int iterations = 1000;
 static char *output_file;
+static int id;
 
 
 void hexdump(const void *buf, unsigned long size)
@@ -374,7 +375,7 @@ int add_service(int fd, void *binder, void *cookie, uint16_t *name, int len)
 
 	tdata = &reply->tdata;
 	if (tdata->data_size != 4 || *(unsigned int *)tdata->data.ptr.buffer) {
-		fprintf(stderr, "invalid reply data received\n");
+		fprintf(stderr, "server invalid reply data received\n");
 		return -1;
 	}
 
@@ -423,16 +424,16 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 		return r;
 
 	tdata = &reply->tdata;
-	if (tdata->data_size == 4 && *(unsigned int *)tdata->data.ptr.buffer)
+	if (tdata->data_size == 4 && !*(unsigned int *)tdata->data.ptr.buffer)
 		return 0;	// server not ready
 
 	if (tdata->data_size != sizeof(*obj) || tdata->offsets_size != 4) {
-		fprintf(stderr, "invalid reply data received\n");
+		fprintf(stderr, "client %d invalid reply data received\n", id);
 		return -1;
 	}
 	obj = (obj_t *)((unsigned char *)tdata->data.ptr.buffer + *(unsigned int *)tdata->data.ptr.offsets);
 	if (obj->type != BINDER_TYPE_HANDLE) {
-		fprintf(stderr, "invalid object type received\n");
+		fprintf(stderr, "client %d invalid object type received\n", id);
 		return -1;
 	}
 	*binder = obj->binder;
@@ -735,7 +736,7 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 	return 0;
 }
 
-int client_main(int id)
+int client_main(void)
 {
 	int fd, r, n, m, wait = 0, retries;
 	void *binder, *cookie;
@@ -935,7 +936,8 @@ int main(int argc, char **argv)
 		pid = fork();
 
 		if (!pid) {
-			client_main(i);
+			id = i;
+			client_main();
 			exit(0);
 		} else if (pid < 0) {
 			fprintf(stderr, "server fork error\n");

@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-obj-m           := binder_old.o binder_new.o
+obj-m           := binder_new.o binder_old.o
 binder_old-y	:= deps.o binder.o
 binder_new-y	:= new/msg_queue.o new/binder.o
 
