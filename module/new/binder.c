@@ -35,6 +35,52 @@
 #include "binder.h"
 
 
+#define KERNEL_INSTRUMENTING
+#ifdef KERNEL_INSTRUMENTING
+typedef union {
+	struct timeval tv;
+	char label[8];
+} inst_entry_t;
+
+typedef struct {
+	uint32_t magic;
+	uint32_t seq;
+	uint32_t max_entries;
+	uint32_t next_entry;
+	inst_entry_t entries[0];
+} inst_buf_t;
+
+static inline void __inst_entry(void *ptr, char *label, struct timeval *copy)
+{
+	inst_buf_t *inst = (inst_buf_t *)ptr;
+
+	if (inst->magic != 0x696e7374)
+		return;
+
+	if (inst->next_entry < inst->max_entries) {
+		inst_entry_t *entry = inst->entries + inst->next_entry++;
+
+		if (inst->seq) {
+			if (!copy) 
+				 do_gettimeofday(&entry->tv);
+			else
+				entry->tv = *copy;
+		} else {
+			strncpy(entry->label, label, 8);
+			entry->label[7] = '\0';
+		}
+	}
+}
+#define INST_ENTRY(p, label)			__inst_entry((p), (label), NULL)
+#define INST_ENTRY_COPY(t, p, label, n)		__inst_entry((p), (label), (t)->__inst_copies + (n))
+#define INST_RECORD(t, n)			do_gettimeofday((t)->__inst_copies + (n));
+#else
+#define INST_ENTRY(b, label)
+#define INST_ENTRY_COPY(t, p, label, n)
+#define INST_RECORD(t, n)
+#endif /* KERNEL_INSTRUMENTING */
+
+
 #define MAX_TRANSACTION_SIZE			4000
 #define OBJ_HASH_BUCKET_SIZE			128
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
@@ -86,6 +132,10 @@ struct binder_thread {
 	struct list_head incoming_transactions;
 
 	struct dentry *info_node;
+
+#ifdef KERNEL_INSTRUMENTING
+	struct timeval __inst_copies[4];
+#endif
 };
 
 struct binder_notifier {
@@ -792,6 +842,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	void *binder, *cookie;
 	uint32_t err;
 
+	INST_RECORD(thread, 1);
+
 	if (bcmd == BC_TRANSACTION) {
 		struct binder_obj *obj;
 
@@ -847,6 +899,10 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_load;
 		}
+
+		INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
+		INST_ENTRY_COPY(thread, msg->buf->data, "K_WR_IN", 1);
+		INST_ENTRY(msg->buf->data, "K_ENQ");
 	}
 
 	if (bcmd_write_msg(q, msg) < 0) {
@@ -1048,6 +1104,8 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	if (data_off + data_size > size)
 		return -ENOSPC;
 
+	INST_ENTRY_COPY(thread, mbuf->data, "K_DEQ", 2);
+
 	tdata.target.ptr = msg->binder;
 	tdata.code = msg->code;
 	tdata.cookie = msg->cookie;
@@ -1083,6 +1141,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 		} else
 			tdata.data.ptr.offsets = NULL;
 
+		INST_ENTRY(mbuf->data, "K_COPY");
 		if (copy_to_user(data_buf, mbuf->data, data_size))
 			return -EFAULT;
 	} else
@@ -1276,6 +1335,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		if (n < 0)
 			goto clean_up;
 
+		INST_RECORD(thread, 2);
 		switch (msg->type) {
 			case BC_TRANSACTION:
 			case BC_REPLY:
@@ -1424,6 +1484,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	thread = binder_get_thread(proc, filp);
 	if (!thread)
 		return -ENOMEM;
+
+	INST_RECORD(thread, 0);
 
 	switch (cmd) {
 		case BINDER_WRITE_READ: {

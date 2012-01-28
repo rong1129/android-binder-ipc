@@ -18,8 +18,9 @@ typedef unsigned int uint32_t;
 
 #define INSTRUCTING_MAX_ENTRIES		16
 
-#define SVC_BINDER			(void *)0x696e7374
-#define SVC_COOKIE			(void *)~((unsigned long)SVC_BINDER)
+#define SVC_MAGIC			0x696e7374
+#define SVC_BINDER			((void *)SVC_MAGIC)
+#define SVC_COOKIE			((void *)SVC_MAGIC)
 
 #define ALIGN(n)        		(((n) + 3) & ~3)
 
@@ -39,6 +40,7 @@ typedef union {
 } inst_entry_t;
 
 typedef struct {
+	uint32_t magic;
 	uint32_t seq;
 	uint32_t max_entries;
 	uint32_t next_entry;
@@ -85,11 +87,12 @@ void hexdump(const void *buf, unsigned long size)
 
 inline void INST_INIT(inst_buf_t *inst)
 {
+	inst->magic = SVC_MAGIC;
 	inst->seq = 0;
 	inst->max_entries = INSTRUCTING_MAX_ENTRIES;
 }
 
-inline void INST_START(inst_buf_t *inst)
+inline void INST_BEGIN(inst_buf_t *inst)
 {
 	inst->next_entry = 0;
 }
@@ -783,7 +786,7 @@ int client_main(int id)
 	p = ibuf;
 	n = iterations + 1;
 	while (n-- > 0) {
-		INST_START(inst);
+		INST_BEGIN(inst);
 
 		retries = 2;
 
