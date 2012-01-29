@@ -14,7 +14,7 @@
 #ifdef INLINE_TRANSACTION_DATA
 #define RBUF_SIZE	4096
 #else
-#define RBUF_SIZE	32
+#define RBUF_SIZE	128
 #endif
 
 
@@ -416,6 +416,20 @@ int add_service(int fd, void *binder, void *cookie, uint16_t *name, int len)
 	return 0;
 }
 
+int start_looper(int fd)
+{
+	bwr_t bwr;
+	uint32_t cmd[1];
+
+	cmd[0] = BC_ENTER_LOOPER;
+
+	memset(&bwr, 0, sizeof(bwr));
+	bwr.write_buffer = (unsigned long)cmd;
+	bwr.write_size = sizeof(cmd);
+
+	return ioctl(fd, BINDER_WRITE_READ, &bwr);
+}
+
 int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie)
 {
 	unsigned char buf[1024], *p;
@@ -492,11 +506,8 @@ int server_parse_command(unsigned char *buf, long size, tdata_t **tdata_out, bcm
 		p += sizeof(cmd);
 
 		switch (cmd) {
-			case BR_TRANSACTION_COMPLETE:
-				break;
-
 			case BR_NOOP:
-				fprintf(stderr, "server received unexpected noop command\n");
+			case BR_TRANSACTION_COMPLETE:
 				break;
 
 			case BR_INCREFS:
@@ -632,8 +643,13 @@ int server_main(void)
 	}
 	printf("server added instrumenting service\n");
 
+	r = start_looper(fd);
+	if (r < 0) {
+		printf("server failed to start looper\n");
+		return -1;
+	}
+	
 	bwr.read_buffer = (unsigned long)rbuf;
-
 	while (1) {
 		bwr.read_size = sizeof(rbuf);
 		bwr.read_consumed = 0;
@@ -706,11 +722,8 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 		p += sizeof(cmd);
 
 		switch (cmd) {
-			case BR_TRANSACTION_COMPLETE:
-				break;
-
 			case BR_NOOP:
-				fprintf(stderr, "client %d received unexpected noop command\n", id);
+			case BR_TRANSACTION_COMPLETE:
 				break;
 
 			case BR_INCREFS:
@@ -897,11 +910,10 @@ wait_reply:
 			}
 		}
 
-		INST_ENTRY_COPY(inst_reply, "C_RECV", &copy);
-		INST_ENTRY(inst_reply, "C_EXIT");
+		memcpy(inst, inst_reply, sizeof(*inst));
 
-		INST_END(inst_reply, &p);
-		INST_END(inst, NULL);
+		INST_ENTRY_COPY(inst, "C_RECV", &copy);
+		INST_END(inst, &p);
 
 #if (defined(SIMULATE_FREE_BUFFER) || !defined(INLINE_TRANSACTION_DATA))
 		if (FREE_BUFFER(fd, inst_reply) < 0) {
@@ -932,8 +944,8 @@ wait_reply:
 		fp = stdout;
 
 	entry = (inst_entry_t *)ibuf;
-	for (n = 0; n < inst_reply->seq; n++) {
-		for (m = 0; m < inst_reply->next_entry; m++) {
+	for (n = 0; n < inst->seq; n++) {
+		for (m = 0; m < inst->next_entry; m++) {
 			if (n > 0) {
 				if (m == 0) {
 					if (time_ref == 0)	// absolute time
