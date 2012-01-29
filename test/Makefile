@@ -1,7 +1,10 @@
 all: binder_tester binderAddInts server client
 
+CFLAGS := -DINLINE_TRANSACTION_DATA
+#CFLAGS += -DSIMULATE_FREE_BUFFER
+
 binder_tester: binder_tester.c
-	gcc -Wall -o $@ -I../module $< 
+	gcc $(CFLAGS) -Wall -o $@ -I../module $< 
 
 binderAddInts: binderAddInts.cpp
 	g++ -o $@ -I../libs/include -L../libs $< -lpthread -lbinder -lrt

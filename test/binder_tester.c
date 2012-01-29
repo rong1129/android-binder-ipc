@@ -7,7 +7,15 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <signal.h>
+
+
+#ifdef INLINE_TRANSACTION_DATA
+#define RBUF_SIZE	4096
+#else
+#define RBUF_SIZE	32
+#endif
 
 
 typedef unsigned char uint8_t;
@@ -54,6 +62,7 @@ static uint16_t service[] = { 'i', 'n', 's', 't' };
 
 static int clients = 1;
 static int time_ref = 1;
+static int inst_kernel = 1;
 static int iterations = 1000;
 static char *output_file;
 static int id;
@@ -88,7 +97,7 @@ void hexdump(const void *buf, unsigned long size)
 
 inline void INST_INIT(inst_buf_t *inst)
 {
-	inst->magic = SVC_MAGIC;
+	inst->magic = inst_kernel ? SVC_MAGIC : ~SVC_MAGIC;
 	inst->seq = 0;
 	inst->max_entries = INSTRUCTING_MAX_ENTRIES;
 }
@@ -134,140 +143,6 @@ inline void INST_END(inst_buf_t *inst, unsigned char **buf)
 		*buf += size;
 	}
 	inst->seq++;
-}
-
-int parse_command(void *buf, unsigned long size, bcmd_txn_t **reply)
-{
-	unsigned char *p, *ep;
-	unsigned int cmd;
-	bcmd_txn_t *txn = NULL;
-	tdata_t *tdata;
-	unsigned long buffer_size;
-
-	p = buf;
-	ep = p + size;
-	while (p < ep) {
-		cmd = *(unsigned int *)p;
-		p += sizeof(cmd);
-
-		switch (cmd) {
-			case BR_NOOP:
-			case BR_TRANSACTION_COMPLETE:
-				break;
-
-			case BR_INCREFS:
-			case BR_ACQUIRE:
-			case BR_RELEASE:
-			case BR_DECREFS:
-				if (p + 2 * sizeof(cmd) > ep) {
-					fprintf(stderr, "not enough ref_cmd data\n");
-					return -1;
-				}
-				p += 2 * sizeof(cmd);
-				break;
-
-			case BR_TRANSACTION:
-				fprintf(stderr, "rcv transaction\n");
-				if (p + sizeof(*tdata) > ep) {
-					fprintf(stderr, "not enough transaction data\n");
-					return -1;
-				}
-
-				tdata = (tdata_t *)p;
-
-				p += sizeof(*tdata);
-				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
-				if (p + buffer_size > ep) {
-					fprintf(stderr, "not enough transaction data buffer\n");
-					return -1;
-				}
-				p += buffer_size;
-				break;
-
-			case BR_REPLY:
-				if (p + sizeof(*tdata) > ep) {
-					fprintf(stderr, "not enough transaction data\n");
-					return -1;
-				}
-
-				tdata = (tdata_t *)p;
-
-				p += sizeof(*tdata);
-				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
-				if (p + buffer_size > ep) {
-					fprintf(stderr, "not enough transaction data buffer\n");
-					return -1;
-				}
-				txn = (bcmd_txn_t *)(p - sizeof(*tdata) - sizeof(cmd));
-				p += buffer_size;
-				goto expected_out;
-
-			case BR_DEAD_BINDER:
-				fprintf(stderr, "rcv DEAD_BINDER\n");
-				if (p + sizeof(cmd) > ep) {
-					fprintf(stderr, "not enough dead binder data\n");
-					return -1;
-				}
-
-				p += sizeof(cmd);
-				break;
-
-			case BR_FAILED_REPLY:
-				fprintf(stderr, "rcv FAILED_BINDER\n");
-				return -1;
-
-			case BR_DEAD_REPLY:
-				fprintf(stderr, "rcv DEAD_BINDER\n");
-				return -1;
-
-			default:
-				fprintf(stderr, "rcv unknown command: %u\n", cmd);
-				return -1;
-		}
-	}
-
-expected_out:
-	*reply = txn;
-	return p - (unsigned char *)buf;
-}
-
-int simple_transact(int fd, bcmd_txn_t *txn, bcmd_txn_t **preply, unsigned char *buf, unsigned int size)
-{
-	bwr_t bwr;
-	bcmd_txn_t *reply = NULL;
-	int r, retries = 2;
-
-	bwr.write_buffer = (unsigned long)txn;
-	bwr.write_size = sizeof(*txn);
-	bwr.write_consumed = 0;
-
-wait_reply:
-	bwr.read_buffer = (unsigned long)buf;
-	bwr.read_size = size;
-	bwr.read_consumed = 0;
-
-	r = ioctl(fd, BINDER_WRITE_READ, &bwr);
-	if (r < 0)
-		return r;
-
-	if (bwr.read_consumed > 0) {
-		r = parse_command(buf, bwr.read_consumed, &reply);
-		if (r < 0)
-			return r;
-	}
-
-	if (reply) {
-		*preply = reply;
-		return 0;
-	}
-
-	if (retries-- <= 0) {
-		fprintf(stderr, "no reply received\n");
-		return -1;
-	}
-
-	bwr.write_size = 0;
-	goto wait_reply;
 }
 
 bcmd_txn_t *create_transaction(int reply,
@@ -320,12 +195,165 @@ bcmd_txn_t *create_transaction(int reply,
 	return txn;
 }
 
+#if (defined(SIMULATE_FREE_BUFFER) || !defined(INLINE_TRANSACTION_DATA))
+int FREE_BUFFER(int fd, void *ptr)
+{
+	bwr_t bwr;
+	uint32_t cmd[2];
+
+	cmd[0] = BC_FREE_BUFFER;
+	cmd[1] = (uint32_t)ptr;
+
+	memset(&bwr, 0, sizeof(bwr));
+	bwr.write_buffer = (unsigned long)cmd;
+	bwr.write_size = sizeof(cmd);
+	return ioctl(fd, BINDER_WRITE_READ, &bwr);
+}
+#endif
+
+int parse_command(void *buf, unsigned long size, tdata_t **reply)
+{
+	unsigned char *p, *ep;
+	unsigned int cmd;
+	tdata_t *tdata = NULL;
+#ifdef INLINE_TRANSACTION_DATA
+	unsigned long buffer_size;
+#endif
+
+	p = buf;
+	ep = p + size;
+	while (p < ep) {
+		cmd = *(unsigned int *)p;
+		p += sizeof(cmd);
+
+		switch (cmd) {
+			case BR_NOOP:
+			case BR_TRANSACTION_COMPLETE:
+				break;
+
+			case BR_INCREFS:
+			case BR_ACQUIRE:
+			case BR_RELEASE:
+			case BR_DECREFS:
+				if (p + 2 * sizeof(cmd) > ep) {
+					fprintf(stderr, "not enough ref_cmd data\n");
+					return -1;
+				}
+				p += 2 * sizeof(cmd);
+				break;
+
+			case BR_TRANSACTION:
+				fprintf(stderr, "rcv transaction\n");
+				if (p + sizeof(*tdata) > ep) {
+					fprintf(stderr, "not enough transaction data\n");
+					return -1;
+				}
+
+				tdata = (tdata_t *)p;
+				p += sizeof(*tdata);
+#ifdef INLINE_TRANSACTION_DATA
+				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
+				if (p + buffer_size > ep) {
+					fprintf(stderr, "not enough transaction data buffer\n");
+					return -1;
+				}
+				p += buffer_size;
+#endif
+				tdata = NULL;
+				break;
+
+			case BR_REPLY:
+				if (p + sizeof(*tdata) > ep) {
+					fprintf(stderr, "not enough transaction data\n");
+					return -1;
+				}
+
+				tdata = (tdata_t *)p;
+				p += sizeof(*tdata);
+#ifdef INLINE_TRANSACTION_DATA
+				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
+				if (p + buffer_size > ep) {
+					fprintf(stderr, "not enough transaction data buffer\n");
+					return -1;
+				}
+				p += buffer_size;
+#endif
+				goto expected_out;
+
+			case BR_DEAD_BINDER:
+				fprintf(stderr, "rcv DEAD_BINDER\n");
+				if (p + sizeof(cmd) > ep) {
+					fprintf(stderr, "not enough dead binder data\n");
+					return -1;
+				}
+
+				p += sizeof(cmd);
+				break;
+
+			case BR_FAILED_REPLY:
+				fprintf(stderr, "rcv FAILED_BINDER\n");
+				return -1;
+
+			case BR_DEAD_REPLY:
+				fprintf(stderr, "rcv DEAD_BINDER\n");
+				return -1;
+
+			default:
+				fprintf(stderr, "rcv unknown command: %u\n", cmd);
+				return -1;
+		}
+	}
+
+expected_out:
+	*reply = tdata;
+	return p - (unsigned char *)buf;
+}
+
+int simple_transact(int fd, bcmd_txn_t *txn, tdata_t **preply, unsigned char *buf, unsigned int size)
+{
+	bwr_t bwr;
+	tdata_t *reply = NULL;
+	int r, retries = 2;
+
+	bwr.write_buffer = (unsigned long)txn;
+	bwr.write_size = sizeof(*txn);
+	bwr.write_consumed = 0;
+
+wait_reply:
+	bwr.read_buffer = (unsigned long)buf;
+	bwr.read_size = size;
+	bwr.read_consumed = 0;
+
+	r = ioctl(fd, BINDER_WRITE_READ, &bwr);
+	if (r < 0)
+		return r;
+
+	if (bwr.read_consumed > 0) {
+		r = parse_command(buf, bwr.read_consumed, &reply);
+		if (r < 0)
+			return r;
+	}
+
+	if (reply) {
+		*preply = reply;
+		return 0;
+	}
+
+	if (retries-- <= 0) {
+		fprintf(stderr, "no reply received\n");
+		return -1;
+	}
+
+	bwr.write_size = 0;
+	goto wait_reply;
+}
+
 int add_service(int fd, void *binder, void *cookie, uint16_t *name, int len)
 {
 	unsigned char buf[1024], *p;
 	obj_t *obj;
 	size_t *offsets;
-	bcmd_txn_t *txn, *reply;
+	bcmd_txn_t *txn;
 	tdata_t *tdata;
 	int r;
 
@@ -369,16 +397,21 @@ int add_service(int fd, void *binder, void *cookie, uint16_t *name, int len)
 	if (!txn)
 		return -1;
 
-	r = simple_transact(fd, txn, &reply, buf, sizeof(buf));
+	r = simple_transact(fd, txn, &tdata, buf, sizeof(buf));
 	if (r < 0)
 		return r;
 
-	tdata = &reply->tdata;
 	if (tdata->data_size != 4 || *(unsigned int *)tdata->data.ptr.buffer) {
 		fprintf(stderr, "server invalid reply data received\n");
 		return -1;
 	}
 
+#if (defined(SIMULATE_FREE_BUFFER) || !defined(INLINE_TRANSACTION_DATA))
+	if (FREE_BUFFER(fd, (void *)tdata->data.ptr.buffer) < 0) {
+		fprintf(stderr, "failed to free shared buffer\n");
+		return -1;
+	}
+#endif
 	free(txn);
 	return 0;
 }
@@ -387,7 +420,7 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 {
 	unsigned char buf[1024], *p;
 	obj_t *obj;
-	bcmd_txn_t *txn, *reply;
+	bcmd_txn_t *txn;
 	tdata_t *tdata;
 	int r;
 
@@ -419,11 +452,10 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 	if (!txn)
 		return -1;
 
-	r = simple_transact(fd, txn, &reply, buf, sizeof(buf));
+	r = simple_transact(fd, txn, &tdata, buf, sizeof(buf));
 	if (r < 0)
 		return r;
 
-	tdata = &reply->tdata;
 	if (tdata->data_size == 4 && !*(unsigned int *)tdata->data.ptr.buffer)
 		return 0;	// server not ready
 
@@ -443,13 +475,15 @@ int lookup_service(int fd, uint16_t *name, int len, void **binder, void **cookie
 	return 1;
 }
 
-int server_parse_command(unsigned char *buf, long size, bcmd_txn_t **txn_out)
+int server_parse_command(unsigned char *buf, long size, tdata_t **tdata_out, bcmd_txn_t **txn_out)
 {
 	unsigned char *p, *ep;
 	unsigned int cmd;
+	tdata_t *tdata = NULL;
 	bcmd_txn_t *txn = NULL;
-	tdata_t *tdata;
+#ifdef INLINE_TRANSACTION_DATA
 	unsigned long buffer_size;
+#endif
 
 	p = buf;
 	ep = p + size;
@@ -484,20 +518,33 @@ int server_parse_command(unsigned char *buf, long size, bcmd_txn_t **txn_out)
 				}
 
 				tdata = (tdata_t *)p;
-
 				p += sizeof(*tdata);
+
+				if (tdata->data_size != sizeof(inst_buf_t)) {
+					fprintf(stderr, "server data size in transaction is incorrect\n");
+					return -1;
+				}
+
+#ifdef INLINE_TRANSACTION_DATA
 				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
 				if (p + buffer_size > ep) {
 					fprintf(stderr, "server not enough transaction data buffer\n");
 					return -1;
 				}
 
-				if (tdata->data_size != sizeof(inst_buf_t)) {
-					fprintf(stderr, "server data size in transaction is incorrect\n");
+				txn = (bcmd_txn_t *)(p - sizeof(*tdata) - sizeof(cmd));
+				txn->cmd = BC_REPLY;
+
+				p += buffer_size;
+#else
+				txn = create_transaction(1, NULL, NULL, 0,
+							(unsigned char *)tdata->data.ptr.buffer, tdata->data_size, 
+							(unsigned char *)tdata->data.ptr.offsets, tdata->offsets_size);
+				if (!txn) {
+					fprintf(stderr, "server failed to create reply buffer\n");
 					return -1;
 				}
-				txn = (bcmd_txn_t *)(p - sizeof(*tdata) - sizeof(cmd));
-				p += buffer_size;
+#endif
 
 				goto expected_out;
 
@@ -509,14 +556,16 @@ int server_parse_command(unsigned char *buf, long size, bcmd_txn_t **txn_out)
 				}
 
 				tdata = (tdata_t *)p;
-
 				p += sizeof(*tdata);
+
+#ifdef INLINE_TRANSACTION_DATA
 				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
 				if (p + buffer_size > ep) {
 					fprintf(stderr, "server not enough transaction data buffer\n");
 					return -1;
 				}
 				p += buffer_size;
+#endif
 				break;
 
 			case BR_DEAD_BINDER:
@@ -544,6 +593,7 @@ int server_parse_command(unsigned char *buf, long size, bcmd_txn_t **txn_out)
 	}
 
 expected_out:
+	*tdata_out = tdata;
 	*txn_out = txn;
 	return (p - buf);
 }
@@ -553,8 +603,9 @@ int server_main(void)
 	int fd, r, len;
 	void *binder, *cookie;
 	bwr_t bwr;
-	unsigned char rbuf[4096], *p;
-	bcmd_txn_t *txn;
+	unsigned char rbuf[RBUF_SIZE], *p;
+	bcmd_txn_t *reply;
+	tdata_t *tdata = NULL;
 	inst_buf_t *inst;
 	inst_entry_t copy;
 
@@ -563,6 +614,13 @@ int server_main(void)
 		fprintf(stderr, "failed to open binder device\n");
 		return -1;
 	}
+
+#if (!defined(INLINE_TRANSACTION_DATA))
+	if (mmap(NULL, 128 * 1024, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) {
+		fprintf(stderr, "server failed to mmap shared buffer\n");
+		return -1;
+	}
+#endif
 
 	binder = SVC_BINDER;
 	cookie = SVC_COOKIE;
@@ -591,22 +649,25 @@ int server_main(void)
 		p = rbuf;
 		len = bwr.read_consumed;
 		while (len > 0) {
-			r = server_parse_command(p, len, &txn);
+			r = server_parse_command(p, len, &tdata, &reply);
 			if (r < 0)
 				return r;
 
 			p += r;
 			len -= r;
 
-			if (!txn)
+#if (defined(SIMULATE_FREE_BUFFER) || !defined(INLINE_TRANSACTION_DATA))
+			if (tdata) 
+				FREE_BUFFER(fd, (void *)tdata->data.ptr.buffer);
+#endif
+			if (!reply)
 				continue;
 
-			txn->cmd = BC_REPLY;
-			inst = (inst_buf_t *)txn->tdata.data.ptr.buffer;
+			inst = (inst_buf_t *)reply->tdata.data.ptr.buffer;
 			INST_ENTRY_COPY(inst, "S_RECV", &copy);
 
-			bwr.write_buffer = (unsigned long)txn;
-			bwr.write_size = sizeof(*txn);
+			bwr.write_buffer = (unsigned long)reply;
+			bwr.write_size = sizeof(*reply);
 			bwr.write_consumed = 0;
 			bwr.read_size = 0;
 
@@ -617,10 +678,14 @@ int server_main(void)
 				fprintf(stderr, "server failed reply ioctl\n");
 				return r;
 			}
+
+#if (!defined(INLINE_TRANSACTION_DATA))
+			free(reply);
+#endif
 		}
 	}
 
-	free(txn);
+	free(reply);
 	return 0;
 }
 
@@ -630,7 +695,9 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 	unsigned int cmd;
 	tdata_t *tdata;
 	inst_buf_t *inst = NULL;
+#ifdef INLINE_TRANSACTION_DATA
 	unsigned long buffer_size;
+#endif
 
 	p = buf;
 	ep = p + size;
@@ -666,14 +733,15 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 				}
 
 				tdata = (tdata_t *)p;
-
 				p += sizeof(*tdata);
+#ifdef INLINE_TRANSACTION_DATA
 				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
 				if (p + buffer_size > ep) {
 					fprintf(stderr, "client %d: not enough transaction data buffer\n", id);
 					return -1;
 				}
 				p += buffer_size;
+#endif
 				break;
 
 			case BR_REPLY:
@@ -683,14 +751,15 @@ int client_parse_command(int id, unsigned char *buf, unsigned long size, inst_bu
 				}
 
 				tdata = (tdata_t *)p;
-
 				p += sizeof(*tdata);
+#ifdef INLINE_TRANSACTION_DATA
 				buffer_size = ALIGN(tdata->data_size) + ALIGN(tdata->offsets_size);
 				if (p + buffer_size > ep) {
 					fprintf(stderr, "client %d: not enough transaction data buffer\n", id);
 					return -1;
 				}
 				p += buffer_size;
+#endif
 
 				if (tdata->data_size != sizeof(inst_buf_t)) {
 					fprintf(stderr, "client %d: data size in reply is incorrect\n", id);
@@ -744,7 +813,7 @@ int client_main(void)
 	bwr_t bwr;
 	inst_buf_t *inst, *inst_reply;
 	inst_entry_t *entry, copy;
-	unsigned char rbuf[4096], *ibuf, *p;
+	unsigned char rbuf[RBUF_SIZE], *ibuf, *p;
 	struct timeval ref, delta;
 	FILE *fp;
 
@@ -753,6 +822,13 @@ int client_main(void)
 		fprintf(stderr, "client %d failed to open binder device\n", id);
 		return -1;
 	}
+
+#if (!defined(INLINE_TRANSACTION_DATA))
+	if (mmap(NULL, 128 * 1024, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) {
+		fprintf(stderr, "server failed to mmap shared buffer\n");
+		return -1;
+	}
+#endif
 
 	while (1) {
 		r = lookup_service(fd, service, sizeof(service) / 2, &binder, &cookie);
@@ -826,6 +902,13 @@ wait_reply:
 
 		INST_END(inst_reply, &p);
 		INST_END(inst, NULL);
+
+#if (defined(SIMULATE_FREE_BUFFER) || !defined(INLINE_TRANSACTION_DATA))
+		if (FREE_BUFFER(fd, inst_reply) < 0) {
+			fprintf(stderr, "client %d: failed to free shared buffer\n", id);
+			return -1;
+		}
+#endif
 	}
 
 	if (output_file) {
@@ -903,8 +986,11 @@ int main(int argc, char **argv)
 	int i, c;
 	pid_t pid;
 
-	while ((c = getopt(argc, argv, "hc:n:o:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hKc:n:o:t:")) != -1) {
 		switch (c) {
+			case 'K':
+				inst_kernel = 0;
+				break;
 			case 'c':
 				clients = atoi(optarg);
 				if (clients < 1)
@@ -924,7 +1010,7 @@ int main(int argc, char **argv)
 					time_ref = 1;
 				break;
 			default:
-				fprintf(stderr, "Usage: binder_test [-c <clients>]\n"
+				fprintf(stderr, "Usage: binder_test [-hK] [-c <clients>]\n"
 						"                   [-n <iterations>]\n"
 						"                   [-o <output file>]\n"
 						"                   [-t <0: absolute | 1: relative-to-first | 2: relative-to-previous]\n");

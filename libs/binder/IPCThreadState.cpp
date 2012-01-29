@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#define INLINE_TRANSACTION_DATA
 #define BUF_ALIGN(x)		(((x) + sizeof(void *) - 1) & ~(sizeof(void *) - 1))
 
 #define LOG_TAG "IPCThreadState"

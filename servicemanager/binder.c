@@ -9,7 +9,6 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#define INLINE_TRANSACTION_DATA
 #define BUF_ALIGN(x)		(((x) + sizeof(void *) - 1) & ~(sizeof(void *) - 1))
 
 #include "binder.h"

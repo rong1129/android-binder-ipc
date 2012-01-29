@@ -7,7 +7,7 @@ The test program binder_tester works like a charm. It timestamps a transaction-r
 0.000000	0.000002	0.000003	0.000004	0.000012	0.000013	0.000015	0.000016	0.000017	0.000018	0.000019	0.000028	0.000030	0.000031	0.000033	
 0.000000	0.000002	0.000003	0.000004	0.000012	0.000013	0.000014	0.000016	0.000017	0.000018	0.000019	0.000028	0.000030	0.000031	0.000032	
 
-The test shows that with a simple C implementation of server and client, a two-way transaction round trip time is about 34us, comparing to 150us-300us I have seen with binderAddInts, which was implemented op top of the framework. 
+The test shows that with a simple C implementation of server and client, a two-way transaction round trip time is about 34us, comparing to 150us-300us I have seen with binderAddInts, which was implemented on top of the framework. 
 
 Further analysis shows that majority of that round trip time (34us) is spent on context switching, which can be deomostrated by the delay between K_ENQ and K_DEQ (happend twice for a two-way message). Those two delays take about half of the total time (~8us each). There are at least two context switches and one task switch happens in that delay, show below,
 
@@ -17,9 +17,9 @@ client ioctl (to read reply)                          -- user to kernel switch
 client blocked on waiting on reply                    -- task switch/wakeup
 server binder_thread_read (K_DEQ)
 
-Other timestamps sugggest a kernel-to-user or user-to-kernel context switch takes about 1us, that leaves about 6us spent on a task switch / waking up. The reason I'm using waking up, because on SMP (which I'm using), switching task could simply mean waking up the ready task on another CPU. Although it's not alway the case, as the scheduler considers other factors, such as cache pollution, in order to schedule a task onto a different CPU.  To further complicate the matter, I'm using BFS for the scheduler, the 3.1.6 vinilla schedule behaves about 20-30% worse.
+Other timestamps sugggest a kernel-to-user or user-to-kernel context switch takes about 1us, that leaves about 6us spent on a task switch / waking up. The reason I'm using waking up, because on SMP (which I'm using), switching task could simply mean waking up the ready task on another CPU. Although it's not alway the case, as the scheduler considers other factors, such as cache pollution, in order to schedule a task onto a different CPU.  To further complicate the matter, I'm using BFS for the scheduler, the 3.1.6 vinilla scheduler behaves about 20-30% worse.
 
-Another thing that the above results sugggest is the framework based test app binderAddInts can't be used to test the performance of the driver as the time spending in the driver (~20-25us) is just a fraction of the total time spent for a binderAddInts two-way message. It also proves at least the extra memory copying I added in the new driver didn't or couldn't do anyting bad except just simplying the driver logic.
+Another thing that the above results sugggest is the framework based test app binderAddInts can't be used for testing the performance of the driver as the time spending in the driver (~20-25us) is just a fraction of the total time spent for a binderAddInts two-way message. It also proves at least the extra memory copying I added in the new driver didn't or couldn't do anyting bad except just simplifying the driver logic.
 
  
 
