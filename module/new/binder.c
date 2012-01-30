@@ -798,8 +798,6 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	void *binder, *cookie;
 	uint32_t err;
 
-	INST_RECORD(thread, 1);
-
 	if (bcmd == BC_TRANSACTION) {
 		struct binder_obj *obj;
 
@@ -818,6 +816,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
+		INST_RECORD(thread, 1);
 
 		q = obj->owner;
 		binder = obj->binder;
@@ -839,6 +838,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
+		INST_RECORD(thread, 1);
 	}
 
 	msg->type = bcmd;
@@ -858,8 +858,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	}
 
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
-	//INST_ENTRY_COPY(thread, msg->buf->data, "K_WR_IN", 1);
-	INST_ENTRY(msg->buf->data, "K_ENQ_IN");
+	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
+	INST_ENTRY(msg->buf->data, "K_WRITE");
 	if (bcmd_write_msg(q, msg) < 0) {
 		err = BR_DEAD_REPLY;
 		goto failed_write;
@@ -1282,7 +1282,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		else
 			q = proc->queue;
 
-		if (msg_queue_empty(q) && ((p != buf) || thread->non_block))
+		if (msg_queue_empty(q) && thread->non_block)
 			break;
 
 		n = _bcmd_read_msg(q, &msg);
@@ -1299,6 +1299,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 
 			case BR_TRANSACTION_COMPLETE:
 				n = bcmd_read_transaction_complete(proc, thread, &msg, p, size);
+				force_return = 1;
 				break;
 
 			case BR_DEAD_BINDER:
@@ -1316,6 +1317,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			// Hack/TODO
 			case BR_ACQUIRE:
 				n = bcmd_read_acquire(proc, thread, &msg, p, size);
+				force_return = 1;
 				break;
 
 			default:

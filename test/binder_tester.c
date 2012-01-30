@@ -10,6 +10,9 @@
 #include <sys/mman.h>
 #include <signal.h>
 
+#define __USE_GNU
+#include <sched.h>
+
 
 #ifdef INLINE_TRANSACTION_DATA
 #define RBUF_SIZE	4096
@@ -24,7 +27,7 @@ typedef unsigned int uint32_t;
 #include "binder.h"
 
 
-#define INSTRUCTING_MAX_ENTRIES		16
+#define INSTRUCTING_MAX_ENTRIES		32
 
 #define SVC_MAGIC			0x696e7374
 #define SVC_BINDER			((void *)SVC_MAGIC)
@@ -63,9 +66,12 @@ static uint16_t service[] = { 'i', 'n', 's', 't' };
 static int clients = 1;
 static int time_ref = 1;
 static int inst_kernel = 1;
+static int share_cpus = 1;
 static int iterations = 1000;
 static char *output_file;
 static int id;
+
+static unsigned int ioctl_read, ioctl_write, ioctl_buffer;
 
 
 void hexdump(const void *buf, unsigned long size)
@@ -207,6 +213,8 @@ int FREE_BUFFER(int fd, void *ptr)
 	memset(&bwr, 0, sizeof(bwr));
 	bwr.write_buffer = (unsigned long)cmd;
 	bwr.write_size = sizeof(cmd);
+
+	ioctl_buffer++;
 	return ioctl(fd, BINDER_WRITE_READ, &bwr);
 }
 #endif
@@ -620,6 +628,18 @@ int server_main(void)
 	inst_buf_t *inst;
 	inst_entry_t copy;
 
+	if (!share_cpus) {
+		cpu_set_t cpuset;
+
+		CPU_ZERO(&cpuset);
+		CPU_SET(0, &cpuset);
+		r = sched_setaffinity(0, sizeof(cpuset), &cpuset);
+		if (!r)
+			printf("server is bound to CPU 0\n");
+		else
+			fprintf(stderr, "server failed to be bound to CPU 0\n");
+	}
+
 	fd = open("/dev/binder", O_RDWR);
 	if (fd < 0) {
 		fprintf(stderr, "failed to open binder device\n");
@@ -655,6 +675,7 @@ int server_main(void)
 		bwr.read_consumed = 0;
 		bwr.write_size = 0;
 
+		ioctl_read++;
 		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 		if (r < 0) {
 			fprintf(stderr, "server failed ioctl\n");
@@ -676,8 +697,10 @@ int server_main(void)
 			if (tdata) 
 				FREE_BUFFER(fd, (void *)tdata->data.ptr.buffer);
 #endif
-			if (!reply)
+			if (!reply) {
+				//hexdump(rbuf, bwr.read_consumed);
 				continue;
+			}
 
 			inst = (inst_buf_t *)reply->tdata.data.ptr.buffer;
 			INST_ENTRY_COPY(inst, "S_RECV", &copy);
@@ -689,6 +712,7 @@ int server_main(void)
 
 			INST_ENTRY(inst, "S_REPLY");
 
+			ioctl_write++;
 			r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 			if (r < 0) {
 				fprintf(stderr, "server failed reply ioctl\n");
@@ -830,6 +854,18 @@ int client_main(void)
 	struct timeval ref, delta;
 	FILE *fp;
 
+	if (!share_cpus) {
+		cpu_set_t cpuset;
+
+		CPU_ZERO(&cpuset);
+		CPU_SET(id + 1, &cpuset);
+		r = sched_setaffinity(0, sizeof(cpuset), &cpuset);
+		if (!r)
+			printf("client %d is bound to CPU %d\n", id, id + 1);
+		else
+			fprintf(stderr, "client %d failed to be bound to CPU %d\n", id, id + 1);
+	}
+
 	fd = open("/dev/binder", O_RDWR);
 	if (fd < 0) {
 		fprintf(stderr, "client %d failed to open binder device\n", id);
@@ -887,7 +923,9 @@ int client_main(void)
 
 		INST_ENTRY(inst, "C_SEND");
 
+		ioctl_write++;
 wait_reply:
+		ioctl_read++;
 		r = ioctl(fd, BINDER_WRITE_READ, &bwr);
 		if (r < 0) {
 			fprintf(stderr, "client %d failed ioctl\n", id);
@@ -900,6 +938,7 @@ wait_reply:
 			return r;
 
 		if (!inst_reply) {
+			//hexdump(rbuf, bwr.read_consumed);
 			if (retries-- > 0) {
 				bwr.write_size = 0;
 				bwr.read_consumed = 0;
@@ -977,6 +1016,9 @@ wait_reply:
 		fclose(fp);
 	free(txn);
 
+	printf("client %d: ioctl read: %u\n", id, ioctl_read);
+	printf("client %d: ioctl write: %u\n", id, ioctl_write);
+	printf("client %d: ioctl buffer: %u\n", id, ioctl_buffer);
 	return 0;
 }
 
@@ -989,8 +1031,13 @@ void children_reaper(int sig)
 		pid = waitpid((pid_t)-1, &stat, WNOHANG | WUNTRACED);
 	} while (pid > 0);
 
-	if (pid < 0)	// no more children
-		exit(0);
+	if (pid >= 0)	// more children
+		return;
+
+	printf("server: ioctl read: %u\n", ioctl_read);
+	printf("server: ioctl write: %u\n", ioctl_write);
+	printf("server: ioctl buffer: %u\n", ioctl_buffer);
+	exit(0);
 }
 
 int main(int argc, char **argv)
@@ -998,10 +1045,13 @@ int main(int argc, char **argv)
 	int i, c;
 	pid_t pid;
 
-	while ((c = getopt(argc, argv, "hKc:n:o:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hKSc:n:o:t:")) != -1) {
 		switch (c) {
 			case 'K':
 				inst_kernel = 0;
+				break;
+			case 'S':
+				share_cpus = 0;
 				break;
 			case 'c':
 				clients = atoi(optarg);
@@ -1022,7 +1072,7 @@ int main(int argc, char **argv)
 					time_ref = 1;
 				break;
 			default:
-				fprintf(stderr, "Usage: binder_test [-hK] [-c <clients>]\n"
+				fprintf(stderr, "Usage: binder_test [-hKS] [-c <clients>]\n"
 						"                   [-n <iterations>]\n"
 						"                   [-o <output file>]\n"
 						"                   [-t <0: absolute | 1: relative-to-first | 2: relative-to-previous]\n");
