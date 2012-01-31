@@ -816,7 +816,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
-		//INST_RECORD(thread, 1);
+		INST_RECORD(thread, 1);
 
 		q = obj->owner;
 		binder = obj->binder;
@@ -838,7 +838,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
-		//INST_RECORD(thread, 1);
+		INST_RECORD(thread, 1);
 	}
 
 	msg->type = bcmd;
@@ -857,9 +857,9 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		}
 	}
 
-	//INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
-	//INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
-	//INST_ENTRY(msg->buf->data, "K_WRITE");
+	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
+	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
+	INST_ENTRY(msg->buf->data, "K_WRITE");
 	if (bcmd_write_msg(q, msg) < 0) {
 		err = BR_DEAD_REPLY;
 		goto failed_write;
@@ -1059,7 +1059,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	if (data_off + data_size > size)
 		return -ENOSPC;
 
-	//INST_ENTRY_COPY(thread, mbuf->data, "K_DEQ", 2);
+	INST_ENTRY_COPY(thread, mbuf->data, "K_DEQ", 2);
 
 	tdata.target.ptr = msg->binder;
 	tdata.code = msg->code;
@@ -1096,7 +1096,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 		} else
 			tdata.data.ptr.offsets = NULL;
 
-		//INST_ENTRY(mbuf->data, "K_COPY");
+		INST_ENTRY(mbuf->data, "K_COPY");
 		if (copy_to_user(data_buf, mbuf->data, data_size))
 			return -EFAULT;
 	} else
@@ -1289,7 +1289,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		if (n < 0)
 			goto clean_up;
 
-		//INST_RECORD(thread, 2);
+		INST_RECORD(thread, 2);
 		switch (msg->type) {
 			case BC_TRANSACTION:
 			case BC_REPLY:
@@ -1445,7 +1445,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (!thread)
 		return -ENOMEM;
 
-	//INST_RECORD(thread, 0);
+	INST_RECORD(thread, 0);
 
 	switch (cmd) {
 		case BINDER_WRITE_READ: {

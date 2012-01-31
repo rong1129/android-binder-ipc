@@ -32,7 +32,7 @@ static inline void __inst_entry(void *ptr, char *label, struct timeval *copy)
 
 		if (inst->seq) {
 			if (!copy) 
-				 do_gettimeofday(&entry->tv);
+				do_gettimeofday(&entry->tv);
 			else
 				entry->tv = *copy;
 		} else {
