@@ -1,5 +1,30 @@
+31 Jan 2012
+Okay, I decided to use the same test program binder_tester to test the performance of the old driver. It was easy to add the support for the old driver, but the inital result didn't quite impress me - in fact I was a little disappointed as on average the round trip time on the old driver is around 17us, where as shown ealier, the new driver on average got around 33us. 
 
-28 Jan 2010
+That wan't a good feeling after all these efforts. So I tried all sorts of measurements to find out why the performance of the new driver was bad. Both the timestamping and perf-sched tool pointed out that the new driver has 8-10us scheduling delay, where the old one has around 5us. If you time it by two you get around extra 6-10us difference, which sort of matched with the round-trip time difference. But why should the scheduler threat two drivers differently? Again, spent hours and hours trying to find out behaviral difference between two drivers. Tried increasing/decreasing transaction data size, nah, didn't work. Tried generating the same responce commands and at the same point, so literaly the application made the same amount of ioctl() for both drivers, didn't work either. Even tried reducing two data copying in the driver to one (by faking) so it acted just like the old driver, no luck. I timestamped many different points in the driver, none of them gave much glues except all pointing to the large scheduling delay.
+
+Eventually, I ran out of ideas. I thought I might do this last try by adding same instrumentation points to the old driver, so I could see what path it actually did do better. The moment I tried, I was shocked - after the old driver being equipted with same amount of instrumentation points, it yielded the same or even slightly longer round trip time. I couldn't understand why would a dozen of memory writes would cause that big scheduling delay. Anyway, seeing this, I decided to disable all the instrumentation points in both drivers, and redo the performance test. This time, I got better or should I say, expected results. The new driver without those instrumentation points get around 16us round trip time. Hooray! sched-perf tool shows both drivers get similar amount of scheduling delay, which is about 5-6us.
+
+So finally all these work paid off. The new driver with a clean design and implementation beats the old driver, even it has twice of memory copying. BTW, the instrumentation buffer I used in the test is 272 bytes, which is carried through back and forth in the transaction and reply messages as transaction data, which I think should be bigger than most of the IPC calls (?). Anyway, at least it proves at that level of data amount or less, memory copying delay is negligible - to be precise it's about 1-2us measued on my test machine.
+
+So here are some test results to show off,
+
+* new driver
+C_SEND		S_RECV		S_REPLY		C_RECV
+0.000000	0.000007	0.000009	0.000016
+
+* old driver
+C_SEND		S_RECV		S_REPLY		C_RECV
+0.000000	0.000007	0.000010	0.000017
+
+The scale is second. From C_SEND to C_RECV is exact a round-trip time measured in the user application. The results shown are averaged over 10,000 iterations.
+
+Finally, the last question remaining is the scheduling delay 5-6us with both drivers, can it be reduced. As learned above, either the speculative reads/writes incurred by those intrumenation points, regardless the trival amount (8 bytes each, up to 12 times), or maybe do_gettimeofday that upset the scheduler or data cache or both. I'll be looking into this a little later.
+
+More tests will be done in the following days to compare the performance of two drivers on other occasions, especially concurrency tests. Stability and functionality will also be tested and improved as I go.
+
+
+28 Jan 2012
 The test program binder_tester works like a charm. It timestamps a transaction-reply roundtrip time, plus all the critical points the data goes through. Example shown below:
 
   C_SEND	   K_IOC	 K_WR_IN	   K_ENQ	   K_DEQ	  K_COPY	  S_RECV	 S_REPLY	   K_IOC	 K_WR_IN	   K_ENQ	   K_DEQ	  K_COPY	  C_RECV	  C_EXIT	

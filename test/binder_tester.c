@@ -27,7 +27,7 @@ typedef unsigned int uint32_t;
 #include "binder.h"
 
 
-#define INSTRUCTING_MAX_ENTRIES		32
+#define INST_MAX_ENTRIES		32
 
 #define SVC_MAGIC			0x696e7374
 #define SVC_BINDER			((void *)SVC_MAGIC)
@@ -55,7 +55,7 @@ typedef struct {
 	uint32_t seq;
 	uint32_t max_entries;
 	uint32_t next_entry;
-	inst_entry_t entries[INSTRUCTING_MAX_ENTRIES];
+	inst_entry_t entries[INST_MAX_ENTRIES];
 } inst_buf_t;
 
 
@@ -105,7 +105,7 @@ inline void INST_INIT(inst_buf_t *inst)
 {
 	inst->magic = inst_kernel ? SVC_MAGIC : ~SVC_MAGIC;
 	inst->seq = 0;
-	inst->max_entries = INSTRUCTING_MAX_ENTRIES;
+	inst->max_entries = INST_MAX_ENTRIES;
 }
 
 inline void INST_BEGIN(inst_buf_t *inst)
@@ -658,10 +658,10 @@ int server_main(void)
 
 	r = add_service(fd, binder, cookie, service, sizeof(service) / 2);
 	if (r < 0) {
-		printf("server failed to add instrumenting service\n");
+		printf("server failed to add instrumentation service\n");
 		return -1;
 	}
-	printf("server added instrumenting service\n");
+	printf("server added instrumentation service\n");
 
 	r = start_looper(fd);
 	if (r < 0) {
@@ -882,16 +882,16 @@ int client_main(void)
 	while (1) {
 		r = lookup_service(fd, service, sizeof(service) / 2, &binder, &cookie);
 		if (r < 0) {
-			fprintf(stderr, "client %d failed to find the instrumenting service\n", id);
+			fprintf(stderr, "client %d failed to find the instrumentation service\n", id);
 			return -1;
 		} else if (r > 0)
 			break;
 
 		if (wait++ > 1)
-			fprintf(stderr, "client %d still waiting on instrumenting service to be ready\n", id);
+			fprintf(stderr, "client %d still waiting on instrumentation service to be ready\n", id);
 		sleep(1);
 	}
-	printf("client %d found instrumenting service\n", id);
+	printf("client %d found instrumentation service\n", id);
 
 	txn = create_transaction(0, binder, cookie, 0, NULL, sizeof(inst_buf_t), NULL, 0);
 	if (!txn) {
@@ -905,9 +905,9 @@ int client_main(void)
 	inst = (inst_buf_t *)txn->tdata.data.ptr.buffer;
 	INST_INIT(inst);
 
-	ibuf = malloc((iterations + 1) * sizeof(inst_entry_t) * INSTRUCTING_MAX_ENTRIES);
+	ibuf = malloc((iterations + 1) * sizeof(inst_entry_t) * INST_MAX_ENTRIES);
 	if (!ibuf)
-		fprintf(stderr, "client %d failed to allocate instrumenting buffer\n", id);
+		fprintf(stderr, "client %d failed to allocate instrumentation buffer\n", id);
 
 	p = ibuf;
 	n = iterations + 1;

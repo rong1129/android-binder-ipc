@@ -1,7 +1,7 @@
 #ifndef _INST_H
 #define _INST_H
 
-#define KERNEL_INSTRUMENTING
+#undef KERNEL_INSTRUMENTING
 
 #ifdef KERNEL_INSTRUMENTING
 #include <linux/time.h>

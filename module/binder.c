@@ -35,6 +35,7 @@
 #include <linux/vmalloc.h>
 
 #include "binder.h"
+#include "new/inst.h"
 
 static DEFINE_MUTEX(binder_lock);
 static DEFINE_MUTEX(binder_deferred_lock);
@@ -336,6 +337,10 @@ struct binder_thread {
 		/* we are also waiting on */
 	wait_queue_head_t wait;
 	struct binder_stats stats;
+
+#ifdef KERNEL_INSTRUMENTING
+	struct timeval __inst_copies[4];
+#endif
 };
 
 struct binder_transaction {
@@ -1549,6 +1554,8 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error = BR_FAILED_REPLY;
 		goto err_binder_alloc_buf_failed;
 	}
+	//INST_RECORD(thread, 1);
+
 	t->buffer->allow_user_free = 0;
 	t->buffer->debug_id = t->debug_id;
 	t->buffer->transaction = t;
@@ -1715,6 +1722,9 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_bad_object_type;
 		}
 	}
+	//INST_ENTRY_COPY(thread, t->buffer->data, "K_IOC", 0);
+	//INST_ENTRY_COPY(thread, t->buffer->data, "K_ALLOC", 1);
+	//INST_ENTRY(t->buffer->data, "K_WRITE");
 	if (reply) {
 		BUG_ON(t->buffer->async_transaction != 0);
 		binder_pop_transaction(target_thread, in_reply_to);
@@ -1736,6 +1746,7 @@ static void binder_transaction(struct binder_proc *proc,
 	list_add_tail(&t->work.entry, target_list);
 	tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
 	list_add_tail(&tcomplete->entry, &thread->todo);
+	INST_ENTRY(t->buffer->data, "K_WAKE");
 	if (target_wait)
 		wake_up_interruptible(target_wait);
 	return;
@@ -2280,9 +2291,11 @@ retry:
 			break;
 		}
 
+		INST_RECORD(thread, 2);
 		if (end - ptr < sizeof(tr) + 4)
 			break;
 
+		//INST_RECORD(thread, 3);
 		switch (w->type) {
 		case BINDER_WORK_TRANSACTION: {
 			t = container_of(w, struct binder_transaction, work);
@@ -2439,6 +2452,9 @@ retry:
 					ALIGN(t->buffer->data_size,
 					    sizeof(void *));
 
+		INST_ENTRY_COPY(thread, t->buffer->data, "K_READ", 2);
+		//INST_ENTRY_COPY(thread, t->buffer->data, "K_DEQ", 3);
+		//INST_ENTRY(t->buffer->data, "K_COPY");
 		if (put_user(cmd, (uint32_t __user *)ptr))
 			return -EFAULT;
 		ptr += sizeof(uint32_t);
@@ -2641,6 +2657,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ret = -ENOMEM;
 		goto err;
 	}
+
+	//INST_RECORD(thread, 0);
 
 	switch (cmd) {
 	case BINDER_WRITE_READ: {
