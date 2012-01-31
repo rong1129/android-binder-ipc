@@ -1,6 +1,6 @@
 all: binder_tester binderAddInts server client
 
-CFLAGS := -DINLINE_TRANSACTION_DATA -DSIMULATE_FREE_BUFFER
+CFLAGS := -DINLINE_TRANSACTION_DATA #-DSIMULATE_FREE_BUFFER
 
 binder_tester: binder_tester.c
 	gcc $(CFLAGS) -Wall -o $@ -I../module $< 

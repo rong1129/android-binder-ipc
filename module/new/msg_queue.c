@@ -25,38 +25,6 @@ static DEFINE_SPINLOCK(g_queue_lock);
 static struct rb_root g_queue_tree = RB_ROOT;
 
 
-#if 0	// rubbish
-#include "inst.h"
-struct _msg_buf {
-	uint8_t *data;
-	uint8_t *offsets;
-
-	size_t data_size;
-	size_t offsets_size;
-	size_t buf_size;
-
-	struct msg_queue *owners[0];	// owners of the flatten objects
-};
-
-struct _msg {
-	struct list_head list;
-
-	void *binder;
-	void *cookie;
-
-	unsigned int type;		// compat: review all data types in/out of the ioctl
-	unsigned int code;
-	unsigned int flags;
-
-	struct _msg_buf *buf;
-
-	pid_t sender_pid;
-	uid_t sender_euid;
-
-	struct msg_queue *reply_queue;
-};
-#endif
-
 static inline void rb_insert_queue(struct rb_node *node)
 {
 	struct rb_node **p = &g_queue_tree.rb_node;
@@ -166,12 +134,6 @@ static int _write_msg_queue(struct msg_queue *q, struct list_head *msg, int head
 	DECLARE_WAITQUEUE(wait, current);
 	int r;
 
-/*
-struct _msg *_msg = container_of(msg, struct _msg, list);
-inst_buf_t *inst = NULL;
-if (_msg->buf->data_size == 272) inst = (inst_buf_t *)_msg->buf->data;
-*/
-
 	add_wait_queue(&q->wr_wait, &wait);
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -187,13 +149,9 @@ if (_msg->buf->data_size == 272) inst = (inst_buf_t *)_msg->buf->data;
 				list_add(msg, &q->msgs);
 			else
 				list_add_tail(msg, &q->msgs);
-
 			q->num_msgs++;
 			spin_unlock(&q->lock);
 
-/*
-if (inst) INST_ENTRY(inst, "K_WAKE");
-*/
 			wake_up(&q->rd_wait);
 			r = 0;
 			break;
@@ -250,16 +208,6 @@ static int _read_msg_queue(struct msg_queue *q, struct list_head **pmsg, int tai
 			spin_unlock(&q->lock);
 
 			*pmsg = entry;
-/*
-{
-struct _msg *_msg = container_of(entry, struct _msg, list);
-inst_buf_t *inst = NULL;
-if (_msg->buf->data_size == 272) {
-	inst = (inst_buf_t *)_msg->buf->data;
-	INST_ENTRY(inst, "K_READ");
-}
-}
-*/
 
 			wake_up(&q->wr_wait);
 			r = 0;
