@@ -852,6 +852,8 @@ int client_main(void)
 	inst_entry_t *entry, copy;
 	unsigned char rbuf[RBUF_SIZE], *ibuf, *p;
 	struct timeval ref, delta;
+	char labels[INST_MAX_ENTRIES][8];
+	unsigned long long total_usecs[INST_MAX_ENTRIES];
 	FILE *fp;
 
 	if (!share_cpus) {
@@ -982,6 +984,7 @@ wait_reply:
 	} else
 		fp = stdout;
 
+	memset(total_usecs, 0, sizeof(total_usecs));
 	entry = (inst_entry_t *)ibuf;
 	for (n = 0; n < inst->seq; n++) {
 		for (m = 0; m < inst->next_entry; m++) {
@@ -1002,10 +1005,16 @@ wait_reply:
 
 				fprintf(fp, "%ld.%06ld\t", delta.tv_sec, delta.tv_usec);
 
+				if (time_ref > 0)
+					total_usecs[m] += delta.tv_sec * 1000000 + delta.tv_usec;
+
 				if (time_ref > 1)	// relative to the previous entry
 					ref = entry->tv;
-			} else
+			} else {
 				fprintf(fp, "%8s\t", entry->label);
+				if (time_ref > 0)
+					strcpy(labels[m], entry->label);
+			}
 
 			entry++;
 		}
@@ -1019,6 +1028,21 @@ wait_reply:
 	printf("client %d: ioctl read: %u\n", id, ioctl_read);
 	printf("client %d: ioctl write: %u\n", id, ioctl_write);
 	printf("client %d: ioctl buffer: %u\n", id, ioctl_buffer);
+
+	if (time_ref > 0 && iterations > 0) {
+		int pos = 0;
+		char *buf = malloc(64 * m);
+
+		if (!buf)
+			return 1;
+		for (n = 0; n < m; n++) {
+			pos += sprintf(buf + pos, "\t%s: %lld.%02lldus\n", labels[n],
+				(total_usecs[n] / iterations),
+				(total_usecs[n] % iterations) * 100 / iterations);
+		}
+		printf("client %d: average results:\n%s\n", id, buf);
+		free(buf);
+	}
 	return 0;
 }
 
