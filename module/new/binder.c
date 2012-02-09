@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/rbtree.h>
@@ -678,6 +679,7 @@ static int binder_free_proc(struct binder_proc *proc)
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue **owner)
 {
 	struct binder_obj *obj;
+	struct file *file;
 	unsigned long type = bp->type;
 
 	switch (type) {
@@ -705,6 +707,7 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 				return -ENOMEM;
 
 			bp->type = (type == BINDER_TYPE_BINDER) ? BINDER_TYPE_HANDLE : BINDER_TYPE_WEAK_HANDLE;
+			*owner = obj->owner;
 			break;
 
 		case BINDER_TYPE_HANDLE:
@@ -715,19 +718,29 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 
 			bp->binder = obj->binder;
 			bp->cookie = obj->cookie;
+			*owner = obj->owner;
+			break;
+
+		case BINDER_TYPE_FD:
+			file = fget(bp->handle);
+			if (!file)
+				return -EINVAL;
+			bp->binder = file;
+			*owner = NULL;		// unused
 			break;
 
 		default: 
 			return -EINVAL;
 	}
 
-	*owner = obj->owner;
 	return 0;
 }
 
 static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue *owner)
 {
 	struct binder_obj *obj;
+	struct file *file;
+	int fd;
 	unsigned long type = bp->type;
 
 	switch (type) {
@@ -746,6 +759,17 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 			}
 
 			bp->handle = (long)obj->ref;
+			break;
+
+		case BINDER_TYPE_FD:
+			file = (struct file *)bp->binder;
+			fd = get_unused_fd();	// compat/TODO: O_CLOEXEC
+			if (fd < 0) {
+				fput(file);
+				return -ENOMEM;
+			}
+			fd_install(fd, file);
+			bp->handle = fd;	// TODO: fput() when free unread msg!!!
 			break;
 
 		/* No more these types */
@@ -1039,6 +1063,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				break;
 
 			default:
+				printk("unknown binder command %x from process %d\n", bcmd, proc->pid);
 				return -EINVAL;
 		}
 	}
@@ -1490,6 +1515,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return cmd_set_context_mgr(proc);
 
 		default:
+			printk("unknown binder ioctl command %x from process %d\n", cmd, proc->pid);
 			return -EINVAL;
 	}
 }
