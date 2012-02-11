@@ -68,8 +68,8 @@ struct binder_proc {
 
 	pid_t pid;
 
+	atomic_t proc_loopers, requested_loopers, registered_loopers;
 	int max_threads;
-	atomic_t num_loopers, busy_loopers, requested_loopers;
 
 	struct dentry *proc_dir, *thread_dir, *obj_dir;
 	struct list_head garbage_list;	// garbage collected when proc is released
@@ -529,9 +529,9 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	proc->pid = task_tgid_vnr(current);
 	proc->max_threads = 0;
 
-	atomic_set(&proc->num_loopers, 0);
+	atomic_set(&proc->proc_loopers, 0);
 	atomic_set(&proc->requested_loopers, 0);
-	atomic_set(&proc->busy_loopers, 0);
+	atomic_set(&proc->registered_loopers, 0);
 
 	spin_lock_init(&proc->lock);
 	proc->thread_tree.rb_node = NULL;
@@ -937,9 +937,9 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			goto failed_load;
 		}
 	}
-	//printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
-	//_hexdump(tdata, sizeof(*tdata));
-	//_dump_msg(msg);
+	printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
+	_hexdump(tdata, sizeof(*tdata));
+	_dump_msg(msg);
 
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
@@ -1024,25 +1024,24 @@ static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thr
 		case BC_ENTER_LOOPER:
 			if (thread->state & BINDER_LOOPER_STATE_READY)
 				err = BR_FAILED_REPLY;
-			else {
+			else
 				thread->state |= BINDER_LOOPER_STATE_ENTERED;
-				atomic_inc(&proc->num_loopers);
-			}
 			break;
 
 		case BC_EXIT_LOOPER:
-			if (thread->state & BINDER_LOOPER_STATE_ENTERED) {
+			if (thread->state & BINDER_LOOPER_STATE_ENTERED)
 				thread->state &= ~BINDER_LOOPER_STATE_READY;
-				atomic_dec(&proc->num_loopers);
-			} else
+			else
 				err = BR_FAILED_REPLY;
 			break;
 
 		case BC_REGISTER_LOOPER:
 			if (thread->state & BINDER_LOOPER_STATE_READY)
 				err = BR_FAILED_REPLY;
-			else
+			else {
+				atomic_inc(&proc->registered_loopers);
 				atomic_dec(&proc->requested_loopers);
+			}
 			break;
 
 		default:
@@ -1184,12 +1183,17 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 		INST_ENTRY(mbuf->data, "K_COPY");
 		if (copy_to_user(data_buf, mbuf->data, data_size))
 			return -EFAULT;
+
+		printk("proc %d read transaction data at %p, size %d\n", proc->pid, data_buf, data_size);
+		_hexdump(mbuf->data, data_size);
 	} else
 		tdata.data.ptr.buffer = tdata.data.ptr.offsets = NULL;
 
 	if (put_user(cmd, (uint32_t *)buf) ||
 	    copy_to_user(buf + sizeof(cmd), &tdata, sizeof(tdata)))
 		return -EFAULT;
+	printk("proc %d read transaction at %p, size %d\n", proc->pid, buf+sizeof(cmd), sizeof(tdata));
+	_hexdump(&tdata, sizeof(tdata));
 
 	if (msg->type == BC_TRANSACTION) {
 		if (!(msg->flags & TF_ONE_WAY))
@@ -1320,7 +1324,7 @@ static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *th
 static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsigned long size)
 {
 	uint32_t cmd = BR_SPAWN_LOOPER;
-	int n, num_loopers, busy_loopers;
+	int n;
 
 	if (size < sizeof(cmd))
 		return 0;
@@ -1328,12 +1332,14 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 	n = msg_queue_size(proc->queue);
 
 	// smp_rmb();
-	num_loopers = atomic_read(&proc->num_loopers) + atomic_read(&proc->requested_loopers);
-	busy_loopers = atomic_read(&proc->busy_loopers);
-
-	if (num_loopers < (busy_loopers + n) && num_loopers < proc->max_threads) {
+	if ((atomic_read(&proc->proc_loopers) < n) && (atomic_read(&proc->registered_loopers) < proc->max_threads) &&
+	    !atomic_read(&proc->requested_loopers)) {
 		if (put_user(cmd, (uint32_t *)buf))
 			return -EFAULT;
+
+printk("proc %d is requested to spawn, registered_loopers %d, requested_loopers %d, proc_loopers %d, max_threads %d\n",
+	proc->pid, atomic_read(&proc->registered_loopers),atomic_read(&proc->requested_loopers),
+	atomic_read(&proc->proc_loopers),proc->max_threads);
 
 		atomic_inc(&proc->requested_loopers);
 		return sizeof(cmd);
@@ -1347,7 +1353,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 	struct msg_queue *q;
 	struct bcmd_msg *msg = NULL;
 	void __user *p = buf;
-	int force_return = 0;
+	int proc_looper = 0, force_return = 0;
 	long n;
 
 	if (thread->last_error) {
@@ -1360,17 +1366,21 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		return p - buf;	// error returned immediately
 	}
 
-	n = bcmd_spawn_on_busy(proc, p, size);
-	if (n)	// spawn or error returned immediately
-		return n;
-
-	atomic_inc(&proc->busy_loopers);
+	if (thread->state & BINDER_LOOPER_STATE_READY) {	// compat: only ready threads can request spawn
+		n = bcmd_spawn_on_busy(proc, p, size);
+		if (n)	// spawn or error returned immediately
+			return n;
+	}
 
 	while (size >= sizeof(uint32_t) && !force_return) {
 		if (thread->pending_replies > 0 || !msg_queue_empty(thread->queue))
 			q = thread->queue;
-		else
+		else {
 			q = proc->queue;
+
+			proc_looper = 1;
+			atomic_inc(&proc->proc_loopers);
+		}
 
 		if (msg_queue_empty(q) && thread->non_block)
 			break;
@@ -1378,8 +1388,13 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		n = _bcmd_read_msg(q, &msg);
 		if (n < 0)
 			goto clean_up;
-
 		INST_RECORD(thread, 2);
+
+		if (proc_looper) {
+			atomic_dec(&proc->proc_loopers);
+			proc_looper = 0;
+		}
+
 		switch (msg->type) {
 			case BC_TRANSACTION:
 			case BC_REPLY:
@@ -1437,7 +1452,8 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 	}
 
 clean_up:
-	atomic_dec(&proc->busy_loopers);
+	if (proc_looper)
+		atomic_dec(&proc->proc_loopers);
 
 	if (n < 0)
 		return n;
@@ -1629,8 +1645,8 @@ static int debugfs_proc_info(struct seq_file *seq, void *start)
 	seq_printf(seq, "queue: %p\n", proc->queue);
 	seq_printf(seq, "obj_seq: %lu\n", proc->obj_seq);
 	seq_printf(seq, "max_threads: %d\n", proc->max_threads);
-	seq_printf(seq, "num_loopers: %d\n", atomic_read(&proc->num_loopers));
-	seq_printf(seq, "busy_loopers: %d\n", atomic_read(&proc->busy_loopers));
+	seq_printf(seq, "registered_loopers: %d\n", atomic_read(&proc->registered_loopers));
+	seq_printf(seq, "proc_loopers: %d\n", atomic_read(&proc->proc_loopers));
 	seq_printf(seq, "requested_loopers: %d\n", atomic_read(&proc->requested_loopers));
 
 	put_msg_queue(priv->owner);
