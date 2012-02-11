@@ -125,6 +125,12 @@ struct bcmd_notifier_data {
 	void *cookie;
 };
 
+struct bcmd_ref_return {
+	uint32_t cmd;
+	void *binder;
+	void *cookie;
+};
+
 struct bcmd_msg_buf {
 	uint8_t *data;
 	uint8_t *offsets;
@@ -175,7 +181,7 @@ static struct debugfs_priv *debugfs_new_obj(struct binder_proc *proc, struct bin
 
 static inline int binder_cmp(void *owner0, void *binder0, void *owner1, void *binder1)
 {
-	size_t sign;
+	ssize_t sign;
 
 	if ((sign = owner0 - owner1))
 		return (sign > 0) ? 1 : -1;
@@ -415,6 +421,59 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 
 	kfree(msg);
 	return binder_alloc_msg(data_size, offsets_size);
+}
+
+void _hexdump(const void *buf, unsigned long size)
+{
+	int col = 0, off = 0, n = 0;
+	unsigned char *p = (unsigned char *)buf;
+	char cbuf[64];
+
+	while (size--) {
+		if (!col)
+			printk("\t%08x:", off);
+
+		printk(" %02x", *p);
+		cbuf[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : ' ';
+		cbuf[n++] = ' ';
+
+		p++;
+		off++;
+		col++;
+
+		if (!(col % 16)) {
+			cbuf[n] = '\0';
+			printk("    %s\n", cbuf);
+			n = 0;
+			col = 0;
+		} else if (!(col % 4))
+			printk("  ");
+	}
+
+	cbuf[n] = '\0';
+	if (col % 16)
+		printk("    %s\n\n", cbuf);
+	else
+		printk("    %s\n", cbuf);
+}
+
+void _dump_msg(struct bcmd_msg *msg)
+{
+	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %p\n", 
+		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_queue);
+	if (msg->buf) {
+		struct bcmd_msg_buf *mbuf = msg->buf;
+
+		if (mbuf->data_size > 0) {
+			printk("\t data size %u\n", mbuf->data_size);
+			_hexdump(mbuf->data, mbuf->data_size);
+
+			if (mbuf->offsets_size > 0) {
+				printk("\t offsets size %u\n", mbuf->offsets_size);
+				_hexdump(mbuf->offsets, mbuf->offsets_size);
+			}
+		}
+	}
 }
 
 static void msg_queue_release(struct msg_queue *q, void *data)
@@ -679,6 +738,7 @@ static int binder_free_proc(struct binder_proc *proc)
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue **owner)
 {
 	struct binder_obj *obj;
+	struct bcmd_msg *msg; 
 	struct file *file;
 	unsigned long type = bp->type;
 
@@ -691,18 +751,15 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 				if (!obj)
 					return -ENOMEM;
 
-				// Hack/TODO: it's hacked to avoid service from crashing when no one holds a strong ref
-				if (1) {
-					struct bcmd_msg *msg; 
+				// compat: notify writer we are referencing this object
+				msg = binder_alloc_msg(0, 0);
+				if (!msg)
+					return -ENOMEM;
 
-					msg = binder_alloc_msg(0, 0);
-					if (!msg)
-						return -ENOMEM;
-					msg->type = BR_ACQUIRE;
-					msg->binder = bp->binder;
-					msg->cookie = bp->cookie;
-					_bcmd_write_msg(thread->queue, msg);
-				}			
+				msg->type = BR_ACQUIRE;
+				msg->binder = bp->binder;
+				msg->cookie = bp->cookie;
+				_bcmd_write_msg(thread->queue, msg);
 			} else if (bp->cookie != obj->cookie)
 				return -ENOMEM;
 
@@ -880,6 +937,9 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			goto failed_load;
 		}
 	}
+	//printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
+	//_hexdump(tdata, sizeof(*tdata));
+	//_dump_msg(msg);
 
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
@@ -1233,23 +1293,28 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 	return sizeof(cmd) * 2;
 }
 
-//Hack/TODO
 static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
 {
 	struct bcmd_msg *msg = *pmsg;
-	uint32_t cmd = msg->type, *p = (uint32_t *)buf;
+	struct bcmd_ref_return cmds[2];
 
-	if (size < sizeof(cmd) * 3)
+	if (size < sizeof(cmds))
 		return -ENOSPC;
 
-	if (put_user(cmd, p++) || 
-	    put_user((uint32_t)msg->binder, p++) ||
-	    put_user((uint32_t)msg->cookie, p++))
+	cmds[0].cmd = BR_INCREFS;
+	cmds[0].binder = msg->binder;
+	cmds[0].cookie = msg->cookie;
+
+	cmds[1].cmd = BR_ACQUIRE;
+	cmds[1].binder = msg->binder;
+	cmds[1].cookie = msg->cookie;
+
+	if (copy_to_user(buf, cmds, sizeof(cmds)))
 		return -EFAULT;
 
 	kfree(*pmsg);
 	*pmsg = NULL;
-	return sizeof(cmd) * 3;
+	return sizeof(cmds);
 }
 
 static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsigned long size)
@@ -1339,7 +1404,6 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 					force_return = 1;
 				break;
 
-			// Hack/TODO
 			case BR_ACQUIRE:
 				n = bcmd_read_acquire(proc, thread, &msg, p, size);
 				force_return = 1;
