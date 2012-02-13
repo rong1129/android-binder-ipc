@@ -1074,7 +1074,9 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	msg->type = bcmd;
 	msg->binder = obj->binder;
 	msg->cookie = notifier->cookie;
-	msg->reply_to = proc->queue;		// notification sent to the process queue
+
+	// dead binder notification sent to the process queue, while clear notifier sent to request thread
+	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? proc->queue : thread->queue;
 
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
 		err = BR_DEAD_REPLY;
@@ -1292,7 +1294,19 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 	struct bcmd_msg *msg = *pmsg;
 	struct binder_notifier *notifier;
 	struct binder_obj *obj;
-	int r = 0;
+
+	if (msg->type == BR_CLEAR_DEATH_NOTIFICATION_DONE) {
+		if (size < sizeof(uint32_t) * 2)
+			return -ENOSPC;
+
+		if (put_user(BR_CLEAR_DEATH_NOTIFICATION_DONE, (uint32_t *)buf) || 
+		    put_user((uint32_t)msg->cookie, (uint32_t *)((unsigned char *)buf + sizeof(uint32_t))))
+			return -EFAULT;
+
+		kfree(msg);
+		*pmsg = NULL;
+		return sizeof(uint32_t) * 2;
+	}
 
 	obj = binder_find_my_obj(proc, msg->binder);
 	if (!obj)
@@ -1310,13 +1324,11 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		spin_lock(&obj->lock);
 		list_add_tail(&notifier->list, &obj->notifiers);
 		spin_unlock(&obj->lock);
+
+		kfree(msg);
 	} else {
 		struct binder_notifier *next;
-		uint32_t cmd = BR_CLEAR_DEATH_NOTIFICATION_DONE;
 		int found = 0;
-
-		if (size < sizeof(cmd) * 2)
-			return -ENOSPC;
 
 		spin_lock(&obj->lock);
 		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
@@ -1331,18 +1343,16 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		spin_unlock(&obj->lock);
 
 		if (found) {
+			msg->type = BR_CLEAR_DEATH_NOTIFICATION_DONE;
+			if (bcmd_write_msg(msg->reply_to, msg) < 0)
+				kfree(msg);
 			kfree(notifier);
-			if (put_user(cmd, (uint32_t *)buf) || 
-			    put_user((uint32_t)msg->cookie, (uint32_t *)((unsigned char *)buf + sizeof(cmd))))
-				return -EFAULT;
-			else
-				r = sizeof(cmd) * 2;
-		}
+		} else
+			kfree(msg);
 	}
 
-	kfree(msg);
 	*pmsg = NULL;
-	return r;
+	return 0;
 }
 
 static long bcmd_read_transaction_complete(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
@@ -1496,6 +1506,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION:
+			case BR_CLEAR_DEATH_NOTIFICATION_DONE:
 				n = bcmd_read_notifier(proc, thread, &msg, p, size);
 				if (n > 0)
 					force_return = 1;
