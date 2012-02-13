@@ -38,8 +38,9 @@
 #include "inst.h"
 
 
-#define MAX_TRANSACTION_SIZE			4000
+#define MAX_TRANSACTION_SIZE			8192
 #define OBJ_HASH_BUCKET_SIZE			128
+#define MAX_TRACE_DEPTH				4
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
 
 
@@ -99,7 +100,7 @@ struct binder_notifier {
 	struct list_head list;
 	int event;
 	void *cookie;
-	struct msg_queue *notify_queue;
+	struct msg_queue *to_notify;
 };
 
 struct binder_obj {
@@ -142,6 +143,11 @@ struct bcmd_msg_buf {
 	struct msg_queue *owners[0];	// owners of the flatten objects
 };
 
+struct bcmd_msg_trace {
+	struct msg_queue *caller_proc;
+	struct msg_queue *caller_thread;
+};
+
 struct bcmd_msg {
 	struct list_head list;
 
@@ -157,7 +163,10 @@ struct bcmd_msg {
 	pid_t sender_pid;
 	uid_t sender_euid;
 
-	struct msg_queue *reply_queue;
+	struct msg_queue *reply_to;
+
+	int trace_depth;
+	struct bcmd_msg_trace traces[MAX_TRACE_DEPTH];
 };
 
 struct debugfs_priv {
@@ -397,6 +406,7 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	mbuf->buf_size = buf_size;
 
 	msg->buf = mbuf;
+	msg->trace_depth = 0;
 	return msg;
 }
 
@@ -416,6 +426,8 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 
 		mbuf->data_size = data_size;
 		mbuf->offsets_size = offsets_size;
+
+		msg->trace_depth = 0;
 		return msg;
 	}
 
@@ -429,6 +441,8 @@ void _hexdump(const void *buf, unsigned long size)
 	unsigned char *p = (unsigned char *)buf;
 	char cbuf[64];
 
+	if (size > 256)
+		size = 256;
 	while (size--) {
 		if (!col)
 			printk("\t%08x:", off);
@@ -460,7 +474,7 @@ void _hexdump(const void *buf, unsigned long size)
 void _dump_msg(struct bcmd_msg *msg)
 {
 	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %p\n", 
-		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_queue);
+		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
 	if (msg->buf) {
 		struct bcmd_msg_buf *mbuf = msg->buf;
 
@@ -486,7 +500,7 @@ static void msg_queue_release(struct msg_queue *q, void *data)
 
 		if (msg->type == BC_TRANSACTION) {
 			msg->type = BR_DEAD_BINDER;
-			if (!bcmd_write_msg(msg->reply_queue, msg))
+			if (!bcmd_write_msg(msg->reply_to, msg))
 				continue;
 		}
 
@@ -649,8 +663,8 @@ static int binder_free_thread(struct binder_proc *proc, struct binder_thread *th
 
 		msg->type = BR_DEAD_BINDER;
 
-		BUG_ON(!msg->reply_queue);
-		if (bcmd_write_msg(msg->reply_queue, msg) < 0)
+		BUG_ON(!msg->reply_to);
+		if (bcmd_write_msg(msg->reply_to, msg) < 0)
 			kfree(msg);
 	}
 
@@ -685,7 +699,7 @@ static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 			msg->type = BR_DEAD_BINDER;
 			msg->binder = obj->binder;
 			msg->cookie = notifier->cookie;
-			if (!bcmd_write_msg(notifier->notify_queue, msg))
+			if (!bcmd_write_msg(notifier->to_notify, msg))
 				msg = NULL;
 		}
 		if (msg)
@@ -872,6 +886,63 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 	return 0;
 }
 
+/* The call backtrace machenism implemented in the following two functions is to find the destination thread
+   (to deliver the transaction to, instead of the normal path - process queue) in the case of recurisive calls.
+
+   It addresses scenarios like,
+	1. A -> B -> A. In this case, B's transaction is delivered back to thread A, instead of A's process queue.
+	2. A -> B -> C -> A. In this case, B's transaction is delivered to C's process queue, but C's transaction
+           is delivered to thread A.
+
+   It doesn't impose above thread preference if a caller thread makes consective calls to more than one destination
+   before getting the reply back. For example, like in case 2, if A -> B -> C, and before getting reply back from B,
+   A makes another call to C (A -> C), in which case, the second message is not guranteed to be delivered to thread
+   C who received B's transaction (triggered by A's transaction).
+*/
+static inline int bcmd_fill_traces(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg *msg)
+{
+	struct bcmd_msg_trace *traces = msg->traces;
+	struct bcmd_msg *trace_msg;
+	int n, i;
+
+	traces[0].caller_proc = proc->queue;
+	traces[0].caller_thread = thread->queue;
+	n = 1;
+
+	list_for_each_entry(trace_msg, &thread->incoming_transactions, list) {
+		for (i = 0; i < trace_msg->trace_depth; i++) {
+			traces[n++] = trace_msg->traces[i];
+			if (n >= MAX_TRACE_DEPTH) {
+				printk("binder: pid %d (tid %d) transaction reached maximum call traces (%d), possible dead loop?\n",
+					proc->pid, thread->pid, MAX_TRACE_DEPTH);
+				msg->trace_depth = n;
+				return -1;
+			}
+		}
+	}
+
+	msg->trace_depth = n;
+	return 0;
+}
+
+static inline int bcmd_lookup_caller(struct binder_proc *proc, struct binder_thread *thread, struct msg_queue **dest)
+{
+	struct msg_queue *proc_dest = *dest;
+	struct bcmd_msg *trace_msg;
+	int i;
+
+	list_for_each_entry(trace_msg, &thread->incoming_transactions, list) {
+		for (i = 0; i < trace_msg->trace_depth; i++) {
+			if (trace_msg->traces[i].caller_proc == proc_dest) {
+				*dest = trace_msg->traces[i].caller_thread;
+				return 1;
+			}
+		}
+	}
+	
+	return 0;
+}
+
 static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_transaction_data *tdata, uint32_t bcmd)
 {
 	struct bcmd_msg *msg;
@@ -899,7 +970,11 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		}
 		INST_RECORD(thread, 1);
 
+		bcmd_fill_traces(proc, thread, msg);
+
 		q = obj->owner;
+		bcmd_lookup_caller(proc, thread, &q);
+
 		binder = obj->binder;
 		cookie = obj->cookie;
 	} else {
@@ -911,7 +986,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		msg = list_first_entry(&thread->incoming_transactions, struct bcmd_msg, list);
 		list_del(&msg->list);
 
-		q = msg->reply_queue;
+		q = msg->reply_to;
 		binder = cookie = NULL;		// compat
 
 		msg = binder_realloc_msg(msg, tdata->data_size, tdata->offsets_size);
@@ -929,7 +1004,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	msg->flags = tdata->flags;
 	msg->sender_pid = proc->pid;
 	msg->sender_euid = current->cred->euid;
-	msg->reply_queue = ((bcmd == BC_REPLY) || (tdata->flags & TF_ONE_WAY)) ? NULL : thread->queue; 
+	msg->reply_to = ((bcmd == BC_REPLY) || (tdata->flags & TF_ONE_WAY)) ? NULL : thread->queue; 
 
 	if (tdata->data_size > 0) {
 		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0) {
@@ -937,9 +1012,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			goto failed_load;
 		}
 	}
-	printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
-	_hexdump(tdata, sizeof(*tdata));
-	_dump_msg(msg);
+	//printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
+	//_dump_msg(msg);
 
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
 	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
@@ -974,6 +1048,7 @@ failed_msg:
 failed_transaction:
 failed_obj:
 failed_complete:
+	printk("proc %d (tid %d) write transaction set thread error %x\n", proc->pid, thread->pid, err);
 	thread->last_error = err;
 	return -1;
 }
@@ -999,7 +1074,7 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	msg->type = bcmd;
 	msg->binder = obj->binder;
 	msg->cookie = notifier->cookie;
-	msg->reply_queue = proc->queue;		// notification sent to the process queue
+	msg->reply_to = proc->queue;		// notification sent to the process queue
 
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
 		err = BR_DEAD_REPLY;
@@ -1079,8 +1154,11 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if (tdata.data_size > 0) {
 					size_t objs_size = tdata.offsets_size / sizeof(size_t) * sizeof(struct flat_binder_object);
 
-					if (objs_size > tdata.data_size || tdata.data_size > MAX_TRANSACTION_SIZE)
+					if (objs_size > tdata.data_size || tdata.data_size > MAX_TRANSACTION_SIZE) {
+						printk("binder: pid %d (tid %d) wrote invalid/oversized transaction data %d bytes (max %d)\n",
+							proc->pid, thread->pid, tdata.data_size, MAX_TRANSACTION_SIZE);
 						return -EINVAL;
+					}
 				}
 
 				err += bcmd_write_transaction(proc, thread, &tdata, bcmd);
@@ -1183,21 +1261,22 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 		INST_ENTRY(mbuf->data, "K_COPY");
 		if (copy_to_user(data_buf, mbuf->data, data_size))
 			return -EFAULT;
-
-		printk("proc %d read transaction data at %p, size %d\n", proc->pid, data_buf, data_size);
-		_hexdump(mbuf->data, data_size);
 	} else
 		tdata.data.ptr.buffer = tdata.data.ptr.offsets = NULL;
 
 	if (put_user(cmd, (uint32_t *)buf) ||
 	    copy_to_user(buf + sizeof(cmd), &tdata, sizeof(tdata)))
 		return -EFAULT;
-	printk("proc %d read transaction at %p, size %d\n", proc->pid, buf+sizeof(cmd), sizeof(tdata));
-	_hexdump(&tdata, sizeof(tdata));
+	//printk("proc %d (tid %d) read %s message:\n", proc->pid, thread->pid, (msg->type==BC_REPLY ? "reply" : "transaction"));
+	//_dump_msg(msg);
 
 	if (msg->type == BC_TRANSACTION) {
-		if (!(msg->flags & TF_ONE_WAY))
+		if (!(msg->flags & TF_ONE_WAY)) {
+			if (!list_empty(&thread->incoming_transactions))
+				printk("!!!proc %d (tid %d) having more than 1 transaction on stack\n", proc->pid, thread->pid);
+
 			list_add(&msg->list, &thread->incoming_transactions);		// compat/TODO: shouldn't it be tail?
+		}
 	} else {
 		if (thread->pending_replies > 0)
 			thread->pending_replies--;
@@ -1226,7 +1305,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 			return -ENOMEM;
 		notifier->event = BINDER_EVT_OBJ_DEAD;	// TODO: the only event (hard-coded)
 		notifier->cookie = msg->cookie;
-		notifier->notify_queue = msg->reply_queue;
+		notifier->to_notify = msg->reply_to;
 
 		spin_lock(&obj->lock);
 		list_add_tail(&notifier->list, &obj->notifiers);
@@ -1243,7 +1322,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
 			if (notifier->event == BINDER_EVT_OBJ_DEAD &&
 			    notifier->cookie == msg->cookie &&
-			    notifier->notify_queue == msg->reply_queue) {
+			    notifier->to_notify == msg->reply_to) {
 				found = 1;
 				list_del(&notifier->list);
 				break;
@@ -1356,7 +1435,9 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 	int proc_looper = 0, force_return = 0;
 	long n;
 
+#if 0
 	if (thread->last_error) {
+		printk("proc %d (tid %d) has pending error: %x\n", proc->pid, thread->pid, thread->last_error);
 		if (size >= sizeof(uint32_t)) {
 			if (put_user(thread->last_error, (uint32_t *)p))
 				return -EFAULT;
@@ -1365,6 +1446,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 		}
 		return p - buf;	// error returned immediately
 	}
+#endif
 
 	if (thread->state & BINDER_LOOPER_STATE_READY) {	// compat: only ready threads can request spawn
 		n = bcmd_spawn_on_busy(proc, p, size);
@@ -1455,9 +1537,10 @@ clean_up:
 	if (proc_looper)
 		atomic_dec(&proc->proc_loopers);
 
-	if (n < 0)
+	if (n < 0) {
+		printk("proc %d (tid %d) read transaction failed %ld\n", proc->pid, thread->pid, n);
 		return n;
-	else
+	} else
 		return (p - buf);
 }
 
@@ -1467,15 +1550,19 @@ static inline int cmd_write_read(struct binder_proc *proc, struct binder_thread 
 
 	if (bwr->write_size > 0) {
 		r = binder_thread_write(proc, thread, (void __user *)bwr->write_buffer + bwr->write_consumed, bwr->write_size);
-		if (r < 0)
+		if (r < 0) {
+			printk("proc %d (tid %d) BWR write %d\n", proc->pid, thread->pid, r);
 			return r;
+		}
 		bwr->write_consumed += r;
 	}
 
 	if (bwr->read_size > 0) {
 		r = binder_thread_read(proc, thread, (void __user *)bwr->read_buffer + bwr->read_consumed, bwr->read_size);
-		if (r < 0)
+		if (r < 0) {
+			printk("proc %d (tid %d) BWR read %d\n", proc->pid, thread->pid, r);
 			return r;
+		}
 		bwr->read_consumed += r;
 	}
 
