@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
 #include <linux/file.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -34,14 +35,16 @@
 #include <asm/atomic.h>
 
 #include "msg_queue.h"
+#include "fast_slob.h"
 #include "binder.h"
-#include "inst.h"
 
 
 #define MAX_TRANSACTION_SIZE			8192
 #define OBJ_HASH_BUCKET_SIZE			128
 #define MAX_TRACE_DEPTH				4
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
+
+#define DUMP_MSG(pid, tid, wrt, msg)		//_dump_msg((pid), tid, wrt, msg)
 
 
 enum {	// compat: review looper idea
@@ -67,6 +70,10 @@ struct binder_proc {
 
 	struct msg_queue *queue;
 
+	struct fast_slob *slob;
+	int slob_uses;
+	unsigned long ustart;
+
 	pid_t pid;
 
 	atomic_t proc_loopers, requested_loopers, registered_loopers;
@@ -90,10 +97,6 @@ struct binder_thread {
 	struct list_head incoming_transactions;
 
 	struct dentry *info_node;
-
-#ifdef KERNEL_INSTRUMENTING
-	struct timeval __inst_copies[4];
-#endif
 };
 
 struct binder_notifier {
@@ -471,8 +474,9 @@ void _hexdump(const void *buf, unsigned long size)
 		printk("    %s\n", cbuf);
 }
 
-void _dump_msg(struct bcmd_msg *msg)
+void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
 {
+	printk("proc %d (tid %d) %s %s message:\n", pid, pid, write ? "write" : "read", (msg->type == BC_REPLY) ? "reply" : "transaction");
 	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %p\n", 
 		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
 	if (msg->buf) {
@@ -521,14 +525,17 @@ static void proc_msg_queue_release(struct msg_queue *q, void *data)
 		kfree(priv);
 	}
 
+	if (proc->slob)
+		fast_slob_destroy(proc->slob);
+
 	kfree(proc);
 }
 
 static struct binder_proc *binder_new_proc(struct file *filp)
 {
 	struct binder_proc *proc;
-	int i;
 	struct debugfs_priv *priv;
+	int i;
 
 	proc = kmalloc(sizeof(*proc), GFP_KERNEL);
 	if (!proc)
@@ -540,6 +547,9 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 		return NULL;
 	}
 
+	proc->slob = NULL;
+	proc->slob_uses = 0;
+	proc->ustart = 0;
 	proc->pid = task_tgid_vnr(current);
 	proc->max_threads = 0;
 
@@ -560,7 +570,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	INIT_LIST_HEAD(&proc->garbage_list);
 
 	if (!(priv = debugfs_new_proc(proc))) {
-		// the queue release handle will free proc struct
+		// the queue release handler will free proc struct
 		free_msg_queue(proc->queue);
 		return NULL;
 	}
@@ -968,7 +978,6 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
-		INST_RECORD(thread, 1);
 
 		bcmd_fill_traces(proc, thread, msg);
 
@@ -994,7 +1003,6 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			err = BR_FAILED_REPLY;
 			goto failed_msg;
 		}
-		INST_RECORD(thread, 1);
 	}
 
 	msg->type = bcmd;
@@ -1012,12 +1020,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			goto failed_load;
 		}
 	}
-	//printk("proc %d (tid %d) write %s message:\n", proc->pid, thread->pid, bcmd == BC_REPLY ? "reply" : "transaction");
-	//_dump_msg(msg);
+	DUMP_MSG(proc->pid, thread->pid, 1, msg);
 
-	INST_ENTRY_COPY(thread, msg->buf->data, "K_IOC", 0);
-	INST_ENTRY_COPY(thread, msg->buf->data, "K_ALLOC", 1);
-	INST_ENTRY(msg->buf->data, "K_WRITE");
 	if (bcmd_write_msg(q, msg) < 0) {
 		err = BR_DEAD_REPLY;
 		goto failed_write;
@@ -1048,9 +1052,24 @@ failed_msg:
 failed_transaction:
 failed_obj:
 failed_complete:
-	printk("proc %d (tid %d) write transaction set thread error %x\n", proc->pid, thread->pid, err);
 	thread->last_error = err;
 	return -1;
+}
+
+static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread *thread, void *uaddr)
+{
+	size_t off;
+	char *data_buf;
+
+	if (!proc->slob || !proc->ustart || (unsigned long)uaddr < proc->ustart)
+		return -1;
+
+	off = (unsigned long)uaddr - proc->ustart;
+	data_buf = proc->slob->start + off;
+
+	// TODO/compat: free references
+	fast_slob_free(proc->slob, data_buf);
+	return 0;
 }
 
 static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_notifier_data *notifier, uint32_t bcmd)
@@ -1156,14 +1175,22 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if (tdata.data_size > 0) {
 					size_t objs_size = tdata.offsets_size / sizeof(size_t) * sizeof(struct flat_binder_object);
 
-					if (objs_size > tdata.data_size || tdata.data_size > MAX_TRANSACTION_SIZE) {
-						printk("binder: pid %d (tid %d) wrote invalid/oversized transaction data %d bytes (max %d)\n",
-							proc->pid, thread->pid, tdata.data_size, MAX_TRANSACTION_SIZE);
+					if (objs_size > tdata.data_size)
 						return -EINVAL;
-					}
 				}
 
 				err += bcmd_write_transaction(proc, thread, &tdata, bcmd);
+				break;
+			}
+
+			case BC_FREE_BUFFER: {
+				void *buffer;
+
+				if (get_user(buffer, (void __user **)p))
+					return -EFAULT;
+				p += sizeof(void *);
+
+				err += bcmd_write_free_buffer(proc, thread, buffer);
 				break;
 			}
 
@@ -1190,7 +1217,6 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 			case BC_RELEASE:
 			case BC_DECREFS:
 			case BC_DEAD_BINDER_DONE:
-			case BC_FREE_BUFFER:	// compat: not used
 				// TODO: do something?
 				p += sizeof(void *);
 				break;
@@ -1202,7 +1228,8 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				break;
 
 			default:
-				printk("unknown binder command %x from process %d\n", bcmd, proc->pid);
+				printk("binder: pid %d (tid %d) unknown binder command %x\n",
+					proc->pid, thread->pid, bcmd);
 				return -EINVAL;
 		}
 	}
@@ -1216,14 +1243,10 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	struct bcmd_msg *msg = *pmsg;
 	struct bcmd_msg_buf *mbuf = msg->buf;
 	uint32_t cmd = (msg->type == BC_TRANSACTION) ? BR_TRANSACTION : BR_REPLY;
-	size_t data_off, data_size;
+	size_t data_size;
 
-	data_off = sizeof(cmd) + sizeof(tdata);
-	data_size = MSG_BUF_ALIGN(mbuf->data_size) + MSG_BUF_ALIGN(mbuf->offsets_size);
-	if (data_off + data_size > size)
+	if (sizeof(cmd) + sizeof(tdata) > size)
 		return -ENOSPC;
-
-	INST_ENTRY_COPY(thread, mbuf->data, "K_DEQ", 2);
 
 	tdata.target.ptr = msg->binder;
 	tdata.code = msg->code;
@@ -1235,10 +1258,21 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	tdata.data_size = mbuf->data_size;
 	tdata.offsets_size = mbuf->offsets_size;
 
+	data_size = MSG_BUF_ALIGN(mbuf->data_size) + MSG_BUF_ALIGN(mbuf->offsets_size);
 	if (data_size > 0) {
-		void __user *data_buf = buf + data_off;
+		char *data_buf;
 
-		tdata.data.ptr.buffer = data_buf;
+		if (proc->slob && proc->ustart) {
+			data_buf = fast_slob_alloc(proc->slob, data_size);
+			if (!data_buf) {
+				printk("binder: pid %d (tid %d) failed to allocate transaction data (%u)\n",
+					proc->pid, thread->pid, data_size);
+				return -ENOMEM;
+			}
+		} else
+			return -ENOMEM;
+
+		tdata.data.ptr.buffer = (void *)(proc->ustart + (data_buf - proc->slob->start));
 
 		if (mbuf->offsets_size > 0) {
 			size_t *p, *ep;
@@ -1256,28 +1290,23 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 					return r;
 			}
 
-			tdata.data.ptr.offsets = data_buf + (mbuf->offsets - mbuf->data);
+			tdata.data.ptr.offsets = (uint8_t *)tdata.data.ptr.buffer + (mbuf->offsets - mbuf->data);
 		} else
 			tdata.data.ptr.offsets = NULL;
 
-		INST_ENTRY(mbuf->data, "K_COPY");
-		if (copy_to_user(data_buf, mbuf->data, data_size))
-			return -EFAULT;
+		memcpy(data_buf, mbuf->data, data_size);
 	} else
 		tdata.data.ptr.buffer = tdata.data.ptr.offsets = NULL;
 
 	if (put_user(cmd, (uint32_t *)buf) ||
 	    copy_to_user(buf + sizeof(cmd), &tdata, sizeof(tdata)))
 		return -EFAULT;
-	//printk("proc %d (tid %d) read %s message:\n", proc->pid, thread->pid, (msg->type==BC_REPLY ? "reply" : "transaction"));
-	//_dump_msg(msg);
+	DUMP_MSG(proc->pid, thread->pid, 0, msg);
 
 	if (msg->type == BC_TRANSACTION) {
 		if (!(msg->flags & TF_ONE_WAY)) {
-			if (!list_empty(&thread->incoming_transactions))
-				printk("!!!proc %d (tid %d) having more than 1 transaction on stack\n", proc->pid, thread->pid);
-
-			list_add(&msg->list, &thread->incoming_transactions);		// compat/TODO: shouldn't it be tail?
+			WARN_ON(!list_empty(&thread->incoming_transactions));
+			list_add_tail(&msg->list, &thread->incoming_transactions);
 		}
 	} else {
 		if (thread->pending_replies > 0)
@@ -1286,7 +1315,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 	}
 
 	*pmsg = NULL;
-	return (data_off + data_size);
+	return (sizeof(cmd) + sizeof(tdata));
 }
 
 static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
@@ -1426,10 +1455,6 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 		if (put_user(cmd, (uint32_t *)buf))
 			return -EFAULT;
 
-printk("proc %d is requested to spawn, registered_loopers %d, requested_loopers %d, proc_loopers %d, max_threads %d\n",
-	proc->pid, atomic_read(&proc->registered_loopers),atomic_read(&proc->requested_loopers),
-	atomic_read(&proc->proc_loopers),proc->max_threads);
-
 		atomic_inc(&proc->requested_loopers);
 		return sizeof(cmd);
 	}
@@ -1478,9 +1503,11 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			break;
 
 		n = _bcmd_read_msg(q, &msg);
-		if (n < 0)
+		if (n < 0) {
+			if (n == -ERESTARTSYS)	// compat
+				n = -EINTR;
 			goto clean_up;
-		INST_RECORD(thread, 2);
+		}
 
 		if (proc_looper) {
 			atomic_dec(&proc->proc_loopers);
@@ -1531,7 +1558,9 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			size -= n;
 		} else if (n < 0) {
 			if (n == -ENOSPC) {
-				if (msg) {	// put msg back to the queue. TODO: ugly
+				if (msg) {	// put msg back to the queue
+					printk("binder: proc %d (tid %d): not enough read space, put message back\n",
+						proc->pid, thread->pid);
 					n = _bcmd_write_msg_head(q, msg);
 					if (n < 0) {
 						kfree(msg);
@@ -1648,8 +1677,6 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (!thread)
 		return -ENOMEM;
 
-	INST_RECORD(thread, 0);
-
 	switch (cmd) {
 		case BINDER_WRITE_READ: {
 			struct binder_write_read bwr;
@@ -1693,7 +1720,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return cmd_set_context_mgr(proc);
 
 		default:
-			printk("unknown binder ioctl command %x from process %d\n", cmd, proc->pid);
+			printk("binder: pid %d (tid %d) unknown ioctl command %x\n",
+				proc->pid, thread->pid, cmd);
 			return -EINVAL;
 	}
 }
@@ -1724,9 +1752,58 @@ static int binder_flush(struct file *filp, fl_owner_t id)
 	return 0;	// compat
 }
 
+static void binder_vm_open(struct vm_area_struct *vma)
+{
+	struct binder_proc *proc = vma->vm_private_data;
+
+	proc->slob_uses++;
+}
+
+static void binder_vm_close(struct vm_area_struct *vma)
+{
+	struct binder_proc *proc = vma->vm_private_data;
+
+	if (--proc->slob_uses <= 0)
+		proc->ustart = 0;
+}
+
+static struct vm_operations_struct binder_vm_ops = {
+	.open = binder_vm_open,
+	.close = binder_vm_close,
+};
+
 static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	return 0;	// compat
+	struct binder_proc *proc = filp->private_data;
+	size_t size = vma->vm_end - vma->vm_start;
+	int r;
+
+	if (size > 4096 * 1024)		// compat
+		size = 4096 * 1024;
+
+	if (vma->vm_flags & VM_WRITE)
+		return -EPERM;
+
+	if (proc->ustart || proc->slob)	// TODO: free existing slob?
+		return -EBUSY;
+
+	proc->slob = fast_slob_create(size);
+	if (!proc->slob)
+		return -ENOMEM;
+
+	r = remap_vmalloc_range(vma, proc->slob->start, 0);
+	if (r < 0) {
+		fast_slob_destroy(proc->slob);
+		proc->slob = NULL;
+		return r;
+	}
+	vma->vm_flags = vma->vm_flags | VM_DONTCOPY | VM_DONTEXPAND;
+	vma->vm_ops = &binder_vm_ops;
+	vma->vm_private_data = proc;
+
+	proc->ustart = vma->vm_start;
+	proc->slob_uses = 1;
+	return 0;
 }
 
 static int debugfs_proc_info(struct seq_file *seq, void *start)
