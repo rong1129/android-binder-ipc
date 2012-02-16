@@ -39,11 +39,9 @@
 #include "binder.h"
 
 
-#define MAX_TRANSACTION_SIZE			8192
 #define OBJ_HASH_BUCKET_SIZE			128
 #define MAX_TRACE_DEPTH				4
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
-
 #define DUMP_MSG(pid, tid, wrt, msg)		//_dump_msg((pid), tid, wrt, msg)
 
 
@@ -117,7 +115,7 @@ struct binder_obj {
 	struct hlist_node hash_node;
 
 	spinlock_t lock;		// used for notifiers only
-	struct list_head notifiers;	// TODO: slow deletion
+	struct list_head notifiers;
 
 	struct dentry *info_node;
 };
@@ -170,6 +168,14 @@ struct bcmd_msg {
 
 	int trace_depth;
 	struct bcmd_msg_trace traces[MAX_TRACE_DEPTH];
+};
+
+struct slob_buf {
+	unsigned long uaddr_data;
+	unsigned long uaddr_offsets;
+	size_t data_size;
+	size_t offsets_size;
+	char data[0];
 };
 
 struct debugfs_priv {
@@ -467,11 +473,13 @@ void _hexdump(const void *buf, unsigned long size)
 			printk("  ");
 	}
 
-	cbuf[n] = '\0';
-	if (col % 16)
-		printk("    %s\n\n", cbuf);
-	else
-		printk("    %s\n", cbuf);
+	if (col % 16) {
+		while (col++ < 16) 
+			printk("    ");
+		cbuf[n] = '\0';
+		printk("  %s\n", cbuf);
+	} else
+		printk("\n");
 }
 
 void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
@@ -479,6 +487,7 @@ void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
 	printk("proc %d (tid %d) %s %s message:\n", pid, pid, write ? "write" : "read", (msg->type == BC_REPLY) ? "reply" : "transaction");
 	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %p\n", 
 		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
+
 	if (msg->buf) {
 		struct bcmd_msg_buf *mbuf = msg->buf;
 
@@ -1059,16 +1068,24 @@ failed_complete:
 static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread *thread, void *uaddr)
 {
 	size_t off;
-	char *data_buf;
+	struct slob_buf *sbuf;
+	int bucket;
 
 	if (!proc->slob || !proc->ustart || (unsigned long)uaddr < proc->ustart)
 		return -1;
 
-	off = (unsigned long)uaddr - proc->ustart;
-	data_buf = proc->slob->start + off;
+	off = (unsigned long)uaddr - proc->ustart - (unsigned long)(((struct slob_buf *)0)->data);
+	sbuf = (struct slob_buf *)(proc->slob->start + off);
+
+	bucket = fast_slob_bucket(proc->slob, sbuf);
+	if (bucket < 0 || (sbuf->uaddr_data != (unsigned long)uaddr)) {
+		printk("binder: pid %d (tid %d) trying to free invalid buffer %p, bucket %d, %lu\n",
+			proc->pid, thread->pid, uaddr, bucket, sbuf->uaddr_data);
+		return -1;
+	}
 
 	// TODO/compat: free references
-	fast_slob_free(proc->slob, data_buf);
+	_fast_slob_free(proc->slob, bucket, sbuf);
 	return 0;
 }
 
@@ -1094,7 +1111,7 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	msg->binder = obj->binder;
 	msg->cookie = notifier->cookie;
 
-	// dead binder notification sent to the process queue, while clear notifier sent to request thread
+	// dead_binder sent to the process queue, while clear_notifcation_done sent to the request thread
 	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? proc->queue : thread->queue;
 
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
@@ -1260,11 +1277,11 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 
 	data_size = MSG_BUF_ALIGN(mbuf->data_size) + MSG_BUF_ALIGN(mbuf->offsets_size);
 	if (data_size > 0) {
-		char *data_buf;
+		struct slob_buf *sbuf;
 
 		if (proc->slob && proc->ustart) {
-			data_buf = fast_slob_alloc(proc->slob, data_size);
-			if (!data_buf) {
+			sbuf = fast_slob_alloc(proc->slob, sizeof(*sbuf) + data_size);
+			if (!sbuf) {
 				printk("binder: pid %d (tid %d) failed to allocate transaction data (%u)\n",
 					proc->pid, thread->pid, data_size);
 				return -ENOMEM;
@@ -1272,7 +1289,11 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 		} else
 			return -ENOMEM;
 
-		tdata.data.ptr.buffer = (void *)(proc->ustart + (data_buf - proc->slob->start));
+		sbuf->data_size = mbuf->data_size;
+		sbuf->offsets_size = mbuf->offsets_size;
+
+		sbuf->uaddr_data = proc->ustart + (sbuf->data - proc->slob->start);
+		tdata.data.ptr.buffer = (void *)sbuf->uaddr_data;
 
 		if (mbuf->offsets_size > 0) {
 			size_t *p, *ep;
@@ -1290,11 +1311,12 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 					return r;
 			}
 
-			tdata.data.ptr.offsets = (uint8_t *)tdata.data.ptr.buffer + (mbuf->offsets - mbuf->data);
+			sbuf->uaddr_offsets = sbuf->uaddr_data + (mbuf->offsets - mbuf->data);
 		} else
-			tdata.data.ptr.offsets = NULL;
+			sbuf->uaddr_offsets = 0;
+		tdata.data.ptr.offsets = (void *)sbuf->uaddr_offsets;
 
-		memcpy(data_buf, mbuf->data, data_size);
+		memcpy(sbuf->data, mbuf->data, data_size);
 	} else
 		tdata.data.ptr.buffer = tdata.data.ptr.offsets = NULL;
 
@@ -1305,7 +1327,8 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 
 	if (msg->type == BC_TRANSACTION) {
 		if (!(msg->flags & TF_ONE_WAY)) {
-			WARN_ON(!list_empty(&thread->incoming_transactions));
+			if (!list_empty(&thread->incoming_transactions))
+			printk("proc %d (tid %d) has more than one transaction on the stack\n", proc->pid, thread->pid);
 			list_add_tail(&msg->list, &thread->incoming_transactions);
 		}
 	} else {

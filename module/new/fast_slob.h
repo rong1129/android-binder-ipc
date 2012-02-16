@@ -91,24 +91,40 @@ static inline void *fast_slob_alloc(struct fast_slob *slob, size_t size)
 	return NULL;
 }
 
-static inline void fast_slob_free(struct fast_slob *slob, void *p)
+static inline int fast_slob_bucket(struct fast_slob *slob, void *p)
 {
-	size_t off, idx, alloc_size, bucket_size;
+	size_t off, alloc_size, bucket_size;
+	int idx;
 
 	if ((char *)p < slob->start || (char *)p >= slob->start + slob->size)
-		return;
+		return -1;
 	
 	off = (char *)p - slob->start;
 	bucket_size = slob->size / NUM_BUCKETS;
 	idx = off / bucket_size;
 	alloc_size = MAX_ALLOC_SIZE >> (ALLOC_SIZE_SHIFT * (NUM_BUCKETS - 1 - idx));
 	if ((off - idx * bucket_size) % alloc_size)
-		return;
+		return -1;
 
+	return idx;
+}
+
+static inline void _fast_slob_free(struct fast_slob *slob, int idx, void *p)
+{
 	spin_lock(&slob->lock);
 	*(char **)p = slob->buckets[idx];
 	slob->buckets[idx] = p;
 	spin_unlock(&slob->lock);
+}
+
+static inline void fast_slob_free(struct fast_slob *slob, void *p)
+{
+	int idx;
+
+	if ((idx = fast_slob_bucket(slob, p)) < 0)
+		return;
+
+	_fast_slob_free(slob, idx, p);
 }
 
 #endif	/* _FAST_SLOB_H */
