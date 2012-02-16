@@ -1,3 +1,24 @@
+17 Feb 2012
+It's been a while since this file was last updated, although the driver has been moving forward all the time.
+
+Fixed a few things, and about a couple of days ago, the driver could get goldfish boot to the end, the system appeared to be normal at the end of booting. The only issue is after boot animation stopped, the home screen doesn't show up. It's been driving me nuts...
+
+To summarize some major changes done in the last a few days,
+
+* mmap and shared kernel/user buffer were finally added. I could have sticked to the inlined buffer mode, but there is just too much overhead to do that. The framework, the driver and applications are all built on the fact that a shared buffer is used. Another benefit of doing that is a full drop replacement of the existing driver is now possible, without requiring to patch the framework or service manager.
+
+* a simple memory allocator (fast slob) is implemented to manager the shared buffer used for transaction data. Seems to be working great, the only limitation it has is there's an up-limit on maximum buffer size allocated. Will restrcuture the interface a bit so service manager and the rest of the framework can use different buffer allocation sizes.
+
+* passing shared file handles across process boundary is now supported.
+
+* object reference counting has just been added, seems to be working fine, although further tests are required.
+
+So far, the driver is not much different to the existing driver in terms of funcationality. I think the only thing left is the re-nice stuff when sending messages. It's trivial and shouldn't affect the function of the driver, so I decided to do it a little later (of course, after some careful thoughts as usual).
+
+I'll be focusing on getting the home screen up - appears to be the last hurdle in getting a working version.
+
+
+
 31 Jan 2012
 Okay, I decided to use the same test program binder_tester to test the performance of the old driver. It was easy to add the support for the old driver, but the inital result didn't quite impress me - in fact I was a little disappointed as on average the round trip time on the old driver is around 17us, where as shown ealier, the new driver on average got around 33us. 
 

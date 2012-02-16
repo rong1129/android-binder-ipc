@@ -844,7 +844,7 @@ static inline int binder_release_obj(struct binder_proc *proc, struct binder_thr
 		hlist_del(&obj->hash_node);
 		spin_unlock(&proc->obj_lock);
 
-		// TODO: review the risk the deleting the object here
+		// TODO: review the risk of deleting the object here
 		return binder_free_obj(proc, obj);
 	}
 
@@ -875,7 +875,7 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 			   read an acquire command, thus preventing the calling thread from destroying the user-level
 			   object. If we wait for the receiving process to send us the acquire, it'd be too late.
 			   That is why in binder_release_obj(), for objects, when the reference count drops to 1 (not 0),
-			   an object is freed. 
+			   the object is freed. 
 
 			   An assumption made here: a BINDER object won't be written twice. TODO: review
 			*/
