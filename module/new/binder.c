@@ -114,6 +114,8 @@ struct binder_obj {
 	unsigned long ref;
 	struct hlist_node hash_node;
 
+	atomic_t refs;
+
 	spinlock_t lock;		// used for notifiers only
 	struct list_head notifiers;
 
@@ -280,6 +282,8 @@ static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner,
 	spin_lock_init(&new_obj->lock);
 	INIT_LIST_HEAD(&new_obj->notifiers);
 
+	atomic_set(&new_obj->refs, 0);
+
 	spin_lock(&proc->obj_lock);
 	while (*p) {
 		parent = *p;
@@ -406,9 +410,9 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	if (!msg)
 		return NULL;
 
-	mbuf = (struct bcmd_msg_buf *)((unsigned char *)msg + sizeof(*msg));
-	mbuf->data = (unsigned char *)msg + msg_size;
-	mbuf->offsets = (unsigned char *)mbuf->data + MSG_BUF_ALIGN(data_size);
+	mbuf = (struct bcmd_msg_buf *)((char *)msg + sizeof(*msg));
+	mbuf->data = (char *)msg + msg_size;
+	mbuf->offsets = (char *)mbuf->data + MSG_BUF_ALIGN(data_size);
 
 	mbuf->data_size = data_size;
 	mbuf->offsets_size = offsets_size;
@@ -430,8 +434,8 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	buf_size = msg_size + MSG_BUF_ALIGN(data_size) + MSG_BUF_ALIGN(offsets_size);
 
 	if (mbuf->buf_size >= buf_size) {
-		mbuf->data = (unsigned char *)msg + msg_size;
-		mbuf->offsets = (unsigned char *)mbuf->data + MSG_BUF_ALIGN(data_size);
+		mbuf->data = (char *)msg + msg_size;
+		mbuf->offsets = (char *)mbuf->data + MSG_BUF_ALIGN(data_size);
 
 		mbuf->data_size = data_size;
 		mbuf->offsets_size = offsets_size;
@@ -571,7 +575,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 
 	for (i = 0; i < sizeof(proc->obj_hash) / sizeof(proc->obj_hash[0]); i++)
 		INIT_HLIST_HEAD(&proc->obj_hash[i]);
-	proc->obj_seq = 1;	// compat: context_mgr_node starts 0?
+	proc->obj_seq = 1;
 
 	spin_lock_init(&proc->obj_lock);
 	proc->obj_tree.rb_node = NULL;
@@ -768,10 +772,88 @@ static int binder_free_proc(struct binder_proc *proc)
 	return 0;
 }
 
+static inline int binder_acquire_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
+{
+	if (atomic_inc_return(&obj->refs) == 1) {
+		struct bcmd_msg *msg; 
+		int r;
+
+		msg = binder_alloc_msg(0, 0);
+		if (!msg)
+			return -ENOMEM;
+
+		if (obj->owner == proc->queue) {
+			// calling thread should get BR_ACQUIRE immediately so it doesn't destory user level object
+			msg->type = BR_ACQUIRE;
+			msg->binder = obj->binder;
+			msg->cookie = obj->cookie;
+			r = _bcmd_write_msg(thread->queue, msg);
+		} else {
+			// tell the owner we are referencing it
+			msg->type = BC_ACQUIRE;
+			msg->binder = obj->binder;
+			msg->cookie = obj->cookie;
+			r = bcmd_write_msg(obj->owner, msg);
+		}
+
+		if (r < 0)
+			kfree(msg);
+		return r;
+	}
+
+	return 0;
+}
+
+static inline int binder_release_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
+{
+	int r = atomic_dec_return(&obj->refs), destroy;
+
+	if (obj->owner == proc->queue)
+		destroy = (r == 1);
+	else
+		destroy = (r == 0);
+	
+	if (destroy) {
+		struct bcmd_msg *msg; 
+		int r;
+
+		msg = binder_alloc_msg(0, 0);
+		if (!msg)
+			return -ENOMEM;
+
+		if (obj->owner == proc->queue) {
+			// compat: deliver BR_RELEASE to the owner proc
+			msg->type = BR_RELEASE;
+			msg->binder = obj->binder;
+			msg->cookie = obj->cookie;
+			r = _bcmd_write_msg(obj->owner, msg);
+		} else {
+			// tell the owner we are no longer referencing it
+			msg->type = BC_RELEASE;
+			msg->binder = obj->binder;
+			msg->cookie = obj->cookie;
+			r = bcmd_write_msg(obj->owner, msg);
+		}
+
+		if (r < 0)
+			kfree(msg);
+
+		// regardless it's an object or a reference, it should cease to exist now
+		spin_lock(&proc->obj_lock);
+		rb_erase(&obj->rb_node, &proc->obj_tree);
+		hlist_del(&obj->hash_node);
+		spin_unlock(&proc->obj_lock);
+
+		// TODO: review the risk the deleting the object here
+		return binder_free_obj(proc, obj);
+	}
+
+	return 0;
+}
+
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue **owner)
 {
 	struct binder_obj *obj;
-	struct bcmd_msg *msg; 
 	struct file *file;
 	unsigned long type = bp->type;
 
@@ -783,21 +865,22 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 				obj = binder_new_obj(proc, bp->binder, bp->cookie);
 				if (!obj)
 					return -ENOMEM;
-
-				// compat: notify writer we are referencing this object
-				msg = binder_alloc_msg(0, 0);
-				if (!msg)
-					return -ENOMEM;
-
-				msg->type = BR_ACQUIRE;
-				msg->binder = bp->binder;
-				msg->cookie = bp->cookie;
-				_bcmd_write_msg(thread->queue, msg);
 			} else if (bp->cookie != obj->cookie)
 				return -ENOMEM;
 
 			bp->type = (type == BINDER_TYPE_BINDER) ? BINDER_TYPE_HANDLE : BINDER_TYPE_WEAK_HANDLE;
 			*owner = obj->owner;
+
+			/* Owner acquires a reference here so within the same ioctl(), the calling thread will
+			   read an acquire command, thus preventing the calling thread from destroying the user-level
+			   object. If we wait for the receiving process to send us the acquire, it'd be too late.
+			   That is why in binder_release_obj(), for objects, when the reference count drops to 1 (not 0),
+			   an object is freed. 
+
+			   An assumption made here: a BINDER object won't be written twice. TODO: review
+			*/
+			if (type == BINDER_TYPE_BINDER)
+				binder_acquire_obj(proc, thread, obj);
 			break;
 
 		case BINDER_TYPE_HANDLE:
@@ -847,8 +930,10 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 				if (!obj)
 					return -ENOMEM;
 			}
-
 			bp->handle = (long)obj->ref;
+
+			if (type == BINDER_TYPE_HANDLE)
+				binder_acquire_obj(proc, thread, obj);
 			break;
 
 		case BINDER_TYPE_FD:
@@ -889,7 +974,7 @@ static int bcmd_write_msg_buf(struct binder_proc *proc, struct binder_thread *th
 
 	n = 0;
 	p = (size_t *)mbuf->offsets;
-	ep = (size_t *)((unsigned char *)mbuf->offsets + mbuf->offsets_size);
+	ep = (size_t *)((char *)mbuf->offsets + mbuf->offsets_size);
 	while (p < ep) {
 		off = *p++;
 		if (off + sizeof(*bp) > mbuf->data_size)
@@ -1084,8 +1169,53 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 		return -1;
 	}
 
-	// TODO/compat: free references
+	if (sbuf->offsets_size > 0) {
+		struct flat_binder_object *bp;
+		struct binder_obj *obj;
+		size_t *p, *ep;
+
+		off = sbuf->uaddr_offsets - sbuf->uaddr_data;
+		p = (size_t *)(sbuf->data + off);
+		ep = (size_t *)((char *)p + sbuf->offsets_size);
+		while (p < ep) {
+			bp = (struct flat_binder_object *)(sbuf->data + *p++);
+
+			if (bp->type == BINDER_TYPE_BINDER)
+				obj = binder_find_my_obj(proc, bp->binder);
+			else if (bp->type == BINDER_TYPE_HANDLE)
+				obj = binder_find_obj_by_ref(proc, bp->handle);
+			else
+				continue;
+
+			if (obj)
+				binder_release_obj(proc, thread, obj);
+		}
+	}
+
 	_fast_slob_free(proc->slob, bucket, sbuf);
+	return 0;
+}
+
+static int bcmd_write_acquire(struct binder_proc *proc, struct binder_thread *thread, unsigned long ref, uint32_t bcmd)
+{
+	struct binder_obj *obj;
+
+	if (bcmd != BC_ACQUIRE && bcmd != BC_RELEASE)
+		return 0;
+
+	if (unlikely(!ref))
+		obj = context_mgr_obj;
+	else
+		obj = binder_find_obj_by_ref(proc, ref);
+
+	if (!obj)
+		return -1;
+
+	if (bcmd == BC_ACQUIRE)
+		binder_acquire_obj(proc, thread, obj);
+	else
+		binder_release_obj(proc, thread, obj);
+
 	return 0;
 }
 
@@ -1211,6 +1341,20 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				break;
 			}
 
+			case BC_ACQUIRE:
+			case BC_RELEASE:
+			case BC_INCREFS:
+			case BC_DECREFS: {
+				void *handle;
+
+				if (get_user(handle, (void __user **)p))
+					return -EFAULT;
+				p += sizeof(void *);
+
+				err += bcmd_write_acquire(proc, thread, (unsigned long)handle, bcmd);
+				break;
+			}
+
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION: {
 				struct bcmd_notifier_data notifier;
@@ -1229,10 +1373,6 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				err += bcmd_write_looper(proc, thread, bcmd);
 				break;
 
-			case BC_INCREFS:
-			case BC_ACQUIRE:
-			case BC_RELEASE:
-			case BC_DECREFS:
 			case BC_DEAD_BINDER_DONE:
 				// TODO: do something?
 				p += sizeof(void *);
@@ -1352,7 +1492,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 			return -ENOSPC;
 
 		if (put_user(BR_CLEAR_DEATH_NOTIFICATION_DONE, (uint32_t *)buf) || 
-		    put_user((uint32_t)msg->cookie, (uint32_t *)((unsigned char *)buf + sizeof(uint32_t))))
+		    put_user((uint32_t)msg->cookie, (uint32_t *)((char *)buf + sizeof(uint32_t))))
 			return -EFAULT;
 
 		kfree(msg);
@@ -1430,7 +1570,7 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 		return -ENOSPC;
 
 	if (put_user(cmd, (uint32_t *)buf) || 
-	    put_user(cookie, (uint32_t *)((unsigned char *)buf + sizeof(cmd))))
+	    put_user(cookie, (uint32_t *)((char *)buf + sizeof(cmd))))
 		return -EFAULT;
 
 	kfree(*pmsg);
@@ -1441,25 +1581,37 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
 {
 	struct bcmd_msg *msg = *pmsg;
-	struct bcmd_ref_return cmds[2];
+	struct bcmd_ref_return cmd;
 
-	if (size < sizeof(cmds))
+	if (msg->type == BC_ACQUIRE || msg->type == BC_RELEASE) {
+		struct binder_obj *obj;
+
+		obj = binder_find_my_obj(proc, msg->binder);
+		if (!obj) {
+			printk("binder: pid %d (tid %d) got ref command (%x) after the binder (%p) is removed\n", 
+				proc->pid, thread->pid, msg->type, msg->binder);
+			return 0;
+		}
+
+		if (msg->type == BC_ACQUIRE)
+			binder_acquire_obj(proc, thread, obj);
+		else
+			binder_release_obj(proc, thread, obj);
+		return 0;
+	}
+
+	if (size < sizeof(cmd))
 		return -ENOSPC;
 
-	cmds[0].cmd = BR_INCREFS;
-	cmds[0].binder = msg->binder;
-	cmds[0].cookie = msg->cookie;
-
-	cmds[1].cmd = BR_ACQUIRE;
-	cmds[1].binder = msg->binder;
-	cmds[1].cookie = msg->cookie;
-
-	if (copy_to_user(buf, cmds, sizeof(cmds)))
+	cmd.cmd = msg->type;
+	cmd.binder = msg->binder;
+	cmd.cookie = msg->cookie;
+	if (copy_to_user(buf, &cmd, sizeof(cmd)))
 		return -EFAULT;
 
 	kfree(*pmsg);
 	*pmsg = NULL;
-	return sizeof(cmds);
+	return sizeof(cmd);
 }
 
 static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsigned long size)
@@ -1472,7 +1624,6 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 
 	n = msg_queue_size(proc->queue);
 
-	// smp_rmb();
 	if ((atomic_read(&proc->proc_loopers) < n) && (atomic_read(&proc->registered_loopers) < proc->max_threads) &&
 	    !atomic_read(&proc->requested_loopers)) {
 		if (put_user(cmd, (uint32_t *)buf))
@@ -1562,9 +1713,13 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 					force_return = 1;
 				break;
 
+			case BC_ACQUIRE:
+			case BC_RELEASE:
 			case BR_ACQUIRE:
+			case BR_RELEASE:
 				n = bcmd_read_acquire(proc, thread, &msg, p, size);
-				force_return = 1;
+				if (n > 0)
+					force_return = 1;
 				break;
 
 			default:
@@ -1647,6 +1802,8 @@ static inline int cmd_set_max_threads(struct binder_proc *proc, int max_threads)
 
 static inline int cmd_set_context_mgr(struct binder_proc *proc)
 {
+	struct binder_obj *obj;
+
 	if (context_mgr_obj) 
 		return -EBUSY;
 
@@ -1655,10 +1812,15 @@ static inline int cmd_set_context_mgr(struct binder_proc *proc)
 	else if (context_mgr_uid != current->cred->euid)
 		return -EPERM;
 
-	context_mgr_obj = binder_new_obj(proc, NULL, NULL);
-	if (!context_mgr_obj)
+	obj = binder_new_obj(proc, NULL, NULL);
+	if (!obj)
 		return -ENOMEM;
 
+	// increase reference count, so it never gets deleted
+	atomic_set(&obj->refs, 100000);
+	smp_mb();
+
+	context_mgr_obj = obj;
 	return 0;
 }
 
@@ -1933,6 +2095,7 @@ seq_show:
 	seq_printf(seq, "owner: %p\n", obj->owner);
 	seq_printf(seq, "binder: %p\n", obj->binder);
 	seq_printf(seq, "cookie: %p\n", obj->cookie);
+	seq_printf(seq, "refs: %d\n", atomic_read(&obj->refs));
 	// TODO: show notifiers
 
 	spin_unlock(&proc->obj_lock);
