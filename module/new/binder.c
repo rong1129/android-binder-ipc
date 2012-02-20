@@ -44,7 +44,7 @@
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
 #define OBJ_IS_BINDER(o)			((o)->owner_queue)
 #define OBJ_IS_HANDLE(o)			(!OBJ_IS_BINDER(o))
-#define DUMP_MSG(pid, tid, wrt, msg)		_dump_msg(pid, tid, wrt, msg)
+#define DUMP_MSG(pid, tid, wrt, msg)		//_dump_msg(pid, tid, wrt, msg)
 
 
 enum {	// compat: review looper idea
@@ -816,7 +816,6 @@ static int binder_free_proc(struct binder_proc *proc)
 static inline int binder_acquire_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
 {
 	int refs = atomic_inc_return(&obj->refs);
-printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder" :"handle", obj->binder, obj->cookie, refs);
 
 	if (refs == 1) {
 		struct bcmd_msg *msg; 
@@ -849,7 +848,6 @@ printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, OBJ
 static inline int binder_release_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
 {
 	int refs = atomic_dec_return(&obj->refs);
-printk("pid %d (tid %d) %s %p/%p decreased to %d\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder" :"handle", obj->binder, obj->cookie, refs);
 
 	if (refs == 0) {
 		struct bcmd_msg *msg; 
@@ -979,8 +977,6 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 					if (atomic_inc_return(&obj->refs) > 1) {
 						/* We aleady have a reference to the object, so tell
 						   the owner to decrease one reference */
-						printk("binder: pid %d (tid %d) received handle %p/%p more than once\n",
-							proc->pid, thread->pid, obj->binder, obj->cookie);
 						r = binder_inform_obj(obj, BC_RELEASE);
 						if (r < 0)
 							return r;
@@ -1212,7 +1208,7 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 
 	bucket = fast_slob_bucket(proc->slob, sbuf);
 	if (bucket < 0 || (sbuf->uaddr_data != (unsigned long)uaddr)) {
-		printk("binder: pid %d (tid %d) trying to free invalid buffer %p, bucket %d, %lu\n",
+		printk("binder: pid %d (tid %d) trying to free an invalid buffer %p, bucket %d, %lu\n",
 			proc->pid, thread->pid, uaddr, bucket, sbuf->uaddr_data);
 		return -1;
 	}
@@ -1235,10 +1231,8 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 			else
 				continue;
 
-			if (obj) {
-printk("pid %d (tid %d) free %s %p/%p in the buffer\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder":"handle", obj->binder, obj->cookie);
+			if (obj)
 				binder_release_obj(proc, thread, obj);
-			}
 		}
 	}
 
@@ -1262,7 +1256,6 @@ static int bcmd_write_acquire(struct binder_proc *proc, struct binder_thread *th
 	if (!obj)
 		return -1;
 
-printk("pid %d (tid %d) %s %s %p/%p, refs now %d\n", proc->pid, thread->pid, bcmd==BC_ACQUIRE? "acquire" : "release", OBJ_IS_BINDER(obj)?"binder":"handle", obj->binder, obj->cookie, atomic_read(&obj->refs));
 	/* For user generated ACQUIRE/RELEASE, we don't send BR_* back, as the reference
 	   has already been acquired when the reference object was created. */
 	if (bcmd == BC_ACQUIRE)
@@ -1441,7 +1434,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				break;
 
 			default:
-				printk("binder: pid %d (tid %d) unknown binder command %x\n",
+				printk("binder: pid %d (tid %d) wrote unknown binder command %x\n",
 					proc->pid, thread->pid, bcmd);
 				return -EINVAL;
 		}
@@ -1524,8 +1517,7 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 
 	if (msg->type == BC_TRANSACTION) {
 		if (!(msg->flags & TF_ONE_WAY)) {
-			if (!list_empty(&thread->incoming_transactions))
-			printk("proc %d (tid %d) has more than one transaction on the stack\n", proc->pid, thread->pid);
+if (!list_empty(&thread->incoming_transactions)) printk("proc %d (tid %d) has more than one transaction on the stack\n", proc->pid, thread->pid);
 			list_add_tail(&msg->list, &thread->incoming_transactions);
 
 			msg = NULL;
@@ -1676,7 +1668,7 @@ static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *th
 
 		obj = binder_find_my_obj(proc, msg->binder);
 		if (!obj) {
-			printk("binder: pid %d (tid %d) got ref command (%x) after the binder (%p) is removed\n", 
+			printk("binder: pid %d (tid %d) got ref command (%x) after the object (%p) is removed\n", 
 				proc->pid, thread->pid, msg->type, msg->binder);
 			r = 0;
 			goto obj_removed;
@@ -1685,19 +1677,15 @@ static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *th
 		if (msg->type == BC_ACQUIRE) {
 			if (atomic_inc_return(&obj->refs) == 1)
 				cmd = BR_ACQUIRE;
-printk("pid %d (tid %d) binder %p/%p increased to %d on command read\n", proc->pid, thread->pid, obj->binder, obj->cookie, atomic_read(&obj->refs));
 		} else {
 			if (atomic_dec_return(&obj->refs) == 0) {
-				cmd = 0;//BR_RELEASE;
-printk("pid %d (tid %d) binder %p/%p decreased to 0 on command read\n", proc->pid, thread->pid, obj->binder, obj->cookie);
+				cmd = BR_RELEASE;
 				binder_free_obj(proc, obj);
-			} else
-printk("pid %d (tid %d) binder %p/%p decreased to %d on command read\n", proc->pid, thread->pid, obj->binder, obj->cookie, atomic_read(&obj->refs));
+			}
 		}
 	}
 
 	if (cmd) {
-printk("pid %d (tid %d) binder %p/%p %s returned to user !!!!!!!!!!!!!!!! \n", proc->pid, thread->pid, msg->binder, msg->cookie, cmd==BR_ACQUIRE?"acquire":"release");
 		ref_cmd.cmd = cmd;
 		ref_cmd.binder = msg->binder;
 		ref_cmd.cookie = msg->cookie;
@@ -1747,7 +1735,6 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 
 #if 0
 	if (thread->last_error) {
-		printk("proc %d (tid %d) has pending error: %x\n", proc->pid, thread->pid, thread->last_error);
 		if (size >= sizeof(uint32_t)) {
 			if (put_user(thread->last_error, (uint32_t *)p))
 				return -EFAULT;
@@ -1861,10 +1848,9 @@ clean_up:
 	if (proc_looper)
 		atomic_dec(&proc->proc_loopers);
 
-	if (n < 0) {
-		printk("proc %d (tid %d) read transaction failed %ld\n", proc->pid, thread->pid, n);
+	if (n < 0)
 		return n;
-	} else
+	else
 		return (p - buf);
 }
 
@@ -1875,7 +1861,7 @@ static inline int cmd_write_read(struct binder_proc *proc, struct binder_thread 
 	if (bwr->write_size > 0) {
 		r = binder_thread_write(proc, thread, (void __user *)bwr->write_buffer + bwr->write_consumed, bwr->write_size);
 		if (r < 0) {
-			printk("proc %d (tid %d) BWR write %d\n", proc->pid, thread->pid, r);
+printk("proc %d (tid %d) BWR write %d\n", proc->pid, thread->pid, r);
 			return r;
 		}
 		bwr->write_consumed += r;
@@ -1884,7 +1870,7 @@ static inline int cmd_write_read(struct binder_proc *proc, struct binder_thread 
 	if (bwr->read_size > 0) {
 		r = binder_thread_read(proc, thread, (void __user *)bwr->read_buffer + bwr->read_consumed, bwr->read_size);
 		if (r < 0) {
-			printk("proc %d (tid %d) BWR read %d\n", proc->pid, thread->pid, r);
+printk("proc %d (tid %d) BWR read %d\n", proc->pid, thread->pid, r);
 			return r;
 		}
 		bwr->read_consumed += r;
