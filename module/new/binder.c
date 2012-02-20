@@ -96,6 +96,7 @@ struct binder_thread {
 	int pending_replies;
 	struct list_head incoming_transactions;
 
+	struct binder_proc *proc;
 	struct dentry *info_node;
 };
 
@@ -456,6 +457,78 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	return binder_alloc_msg(data_size, offsets_size);
 }
 
+static inline int binder_inform_obj(struct binder_obj *obj, unsigned int cmd)
+{
+	struct bcmd_msg *msg; 
+	int r;
+
+	msg = binder_alloc_msg(0, 0);
+	if (!msg)
+		return -ENOMEM;
+
+	msg->type = cmd;
+	msg->binder = obj->binder;
+	msg->cookie = obj->cookie;
+
+	r = bcmd_write_msg(obj->owner, msg);
+	if (r < 0) {
+		kfree(msg);
+		return r;
+	}
+
+	return 0;
+}
+
+static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
+{
+	debugfs_remove(obj->info_node);
+
+	if (OBJ_IS_BINDER(obj)) {
+		struct binder_notifier *notifier, *next;
+		struct bcmd_msg *msg = NULL;
+
+		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
+			list_del(&notifier->list);
+
+			if (!msg) {
+				msg = binder_alloc_msg(0, 0);
+				if (!msg) {
+					kfree(obj);
+					return -ENOMEM;
+				}
+			}
+
+			msg->type = BR_DEAD_BINDER;
+			msg->binder = obj->binder;
+			msg->cookie = notifier->cookie;
+printk("pid %d (tid *) send DEAD_BINDER to queue %lu for binder %p with cookie %p\n", proc->pid, notifier->to_notify, msg->binder, msg->cookie);
+			if (!bcmd_write_msg(notifier->to_notify, msg))
+				msg = NULL;
+
+			kfree(notifier);
+		}
+		if (msg)
+			kfree(msg);
+	} else {
+		// reference - tell the owner we are no longer referencing the object
+		if (atomic_read(&obj->refs) > 0)
+			binder_inform_obj(obj, BR_RELEASE);
+	}
+
+	kfree(obj);
+	return 0;
+}
+
+static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
+{	
+	spin_lock(&proc->obj_lock);
+	rb_erase(&obj->rb_node, &proc->obj_tree);
+	hlist_del(&obj->hash_node);
+	spin_unlock(&proc->obj_lock);
+
+	return _binder_free_obj(proc, obj);
+}
+
 void _hexdump(const void *buf, unsigned long size)
 {
 	int col = 0, off = 0, n = 0;
@@ -515,7 +588,7 @@ void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
 	}
 }
 
-static void msg_queue_release(struct msg_queue *q, void *data)
+static void drain_msg_queue(struct binder_proc *proc, struct msg_queue *q)
 {
 	struct list_head *entry;
 	struct bcmd_msg *msg;
@@ -528,18 +601,74 @@ static void msg_queue_release(struct msg_queue *q, void *data)
 			msg->type = BR_DEAD_REPLY;
 			if (!bcmd_write_msg(msg->reply_to, msg))
 				continue;
+		} else if (msg->type == BC_CLEAR_DEATH_NOTIFICATION) {
+			struct binder_obj *obj;
+
+			obj = binder_find_my_obj(proc, msg->binder);
+			if (obj) {
+				struct binder_notifier *notifier, *next;
+
+				spin_lock(&obj->lock);
+				list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
+					if (notifier->event == BINDER_EVT_OBJ_DEAD &&
+					    notifier->cookie == msg->cookie) {
+						list_del(&notifier->list);
+						kfree(notifier);
+						break;
+					}
+				}
+				spin_unlock(&obj->lock);
+			}
 		}
 
 		kfree(msg);
 	}
 }
 
-static void proc_msg_queue_release(struct msg_queue *q, void *data)
+static void thread_queue_release(struct msg_queue *q, void *data)
+{
+	struct binder_thread *thread = data;
+	struct binder_proc *proc = thread->proc;
+	struct bcmd_msg *msg, *next;
+
+	drain_msg_queue(proc, q);
+
+	list_for_each_entry_safe(msg, next, &thread->incoming_transactions, list) {
+		list_del(&msg->list);
+
+		msg->type = BR_DEAD_REPLY;
+		if (bcmd_write_msg(msg->reply_to, msg) < 0)
+			kfree(msg);
+	}
+
+	spin_lock(&proc->lock);
+	rb_erase(&thread->rb_node, &proc->thread_tree);
+	spin_unlock(&proc->lock);
+
+	kfree(thread);
+
+	// this has to be the last step as the last proc queue user will destroy the proc
+	put_msg_queue(proc->queue);
+}
+
+static void proc_queue_release(struct msg_queue *q, void *data)
 {
 	struct binder_proc *proc = data;
+	struct rb_node *n;
+	struct binder_obj *obj;
 	struct debugfs_priv *priv, *next;
 
-	msg_queue_release(q, NULL);
+	drain_msg_queue(proc, q);
+
+	// safe to free objs and send BR_DEAD_BINDER
+	while ((n = rb_first(&proc->obj_tree))) {
+		obj = rb_entry(n, struct binder_obj, rb_node);
+
+		rb_erase(n, &proc->obj_tree);
+		hlist_del(&obj->hash_node);
+
+		_binder_free_obj(proc, obj);
+	}
 
 	// safe to do garbage collection now
 	list_for_each_entry_safe(priv, next, &proc->garbage_list, list) {
@@ -563,7 +692,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	if (!proc)
 		return NULL;
 
-	proc->queue = create_msg_queue(0, proc_msg_queue_release, proc);
+	proc->queue = create_msg_queue(0, proc_queue_release, proc);
 	if (!proc->queue) {
 		kfree(proc);
 		return NULL;
@@ -612,7 +741,7 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 	if (!new_thread)
 		return NULL;
 
-	new_thread->queue = create_msg_queue(0, msg_queue_release, NULL);
+	new_thread->queue = create_msg_queue(0, thread_queue_release, new_thread);
 	if (!new_thread->queue || !get_msg_queue(msg_queue_id(proc->queue))) {
 		kfree(new_thread);
 		return NULL;
@@ -624,6 +753,7 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 	new_thread->non_block = (filp->f_flags & O_NONBLOCK) ? 1 : 0;	// compat
 	new_thread->pending_replies = 0;
 	INIT_LIST_HEAD(&new_thread->incoming_transactions);
+	new_thread->proc = proc;
 
 	if (!(priv = debugfs_new_thread(proc, new_thread))) {
 		free_msg_queue(new_thread->queue);
@@ -641,8 +771,10 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 		else if (pid > thread->pid)
 			p = &(*p)->rb_right;
 		else {
-			BUG();
 			spin_unlock(&proc->lock);
+			BUG();
+			free_msg_queue(new_thread->queue);
+			kfree(new_thread);
 			return thread;
 		}
 	}
@@ -684,132 +816,24 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc, struct 
 
 static int binder_free_thread(struct binder_proc *proc, struct binder_thread *thread)
 {
-	struct bcmd_msg *msg, *next;
-
-	debugfs_remove(thread->info_node);
-
 	free_msg_queue(thread->queue);
-
-	list_for_each_entry_safe(msg, next, &thread->incoming_transactions, list) {
-		list_del(&msg->list);
-
-		msg->type = BR_DEAD_REPLY;
-		if (bcmd_write_msg(msg->reply_to, msg) < 0)
-			kfree(msg);
-	}
-
-	spin_lock(&proc->lock);
-	rb_erase(&thread->rb_node, &proc->thread_tree);
-	spin_unlock(&proc->lock);
-
-	put_msg_queue(proc->queue);
-	kfree(thread);
+	debugfs_remove(thread->info_node);
 	return 0;
-}
-
-static inline int binder_inform_obj(struct binder_obj *obj, unsigned int cmd)
-{
-	struct bcmd_msg *msg; 
-	int r;
-
-	msg = binder_alloc_msg(0, 0);
-	if (!msg)
-		return -ENOMEM;
-
-	msg->type = cmd;
-	msg->binder = obj->binder;
-	msg->cookie = obj->cookie;
-
-	r = bcmd_write_msg(obj->owner, msg);
-	if (r < 0) {
-		kfree(msg);
-		return r;
-	}
-
-	return 0;
-}
-
-static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
-{
-	debugfs_remove(obj->info_node);
-
-	if (OBJ_IS_BINDER(obj)) {
-		struct binder_notifier *notifier, *next;
-		struct bcmd_msg *msg = NULL;
-
-		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
-			list_del(&notifier->list);
-
-			if (!msg) {
-				msg = binder_alloc_msg(0, 0);
-				if (!msg) {
-					kfree(obj);
-					return -ENOMEM;
-				}
-			}
-
-			msg->type = BR_DEAD_BINDER;
-			msg->binder = obj->binder;
-			msg->cookie = notifier->cookie;
-			if (!bcmd_write_msg(notifier->to_notify, msg))
-				msg = NULL;
-		}
-		if (msg)
-			kfree(msg);
-	} else {
-		// reference - tell the owner we are no longer referencing the object
-		if (atomic_read(&obj->refs) > 0)
-			binder_inform_obj(obj, BR_RELEASE);
-	}
-
-	kfree(obj);
-	return 0;
-}
-
-static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
-{	
-	spin_lock(&proc->obj_lock);
-	rb_erase(&obj->rb_node, &proc->obj_tree);
-	hlist_del(&obj->hash_node);
-	spin_unlock(&proc->obj_lock);
-
-	return _binder_free_obj(proc, obj);
 }
 
 static int binder_free_proc(struct binder_proc *proc)
 {
 	struct rb_node *n;
 	struct binder_thread *thread;
-	struct binder_obj *obj;
-	int r;
 
-	disable_msg_queue(proc->queue);
+	free_msg_queue(proc->queue);
 
 	while ((n = rb_first(&proc->thread_tree))) {
 		thread = rb_entry(n, struct binder_thread, rb_node);
-		r = binder_free_thread(proc, thread);
-		if (r < 0)
-			return r;
+		binder_free_thread(proc, thread);
 	}
-
-	spin_lock(&proc->obj_lock);
-	while ((n = rb_first(&proc->obj_tree))) {
-		obj = rb_entry(n, struct binder_obj, rb_node);
-
-		rb_erase(n, &proc->obj_tree);
-		hlist_del(&obj->hash_node);
-
-		r = _binder_free_obj(proc, obj);
-		if (r < 0) {
-			spin_unlock(&proc->obj_lock);
-			return r;
-		}
-	}
-	spin_unlock(&proc->obj_lock);
 
 	debugfs_remove_recursive(proc->proc_dir);
-
-	free_msg_queue(proc->queue);
 	return 0;
 }
 
@@ -1293,6 +1317,7 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	// dead_binder sent to the process queue, while clear_notifcation_done sent to the request thread
 	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? msg_queue_id(proc->queue) : msg_queue_id(thread->queue);
 
+printk("pid %d/%d (tid %d/%d) %s DEAD_BINDER notifier for binder %p with cookie %p - should send to queue %lu\n", proc->pid, task_tgid_vnr(current), thread->pid, task_pid_vnr(current), (bcmd == BC_REQUEST_DEATH_NOTIFICATION)?"request":"clear", msg->binder, msg->cookie, msg->reply_to);
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
 		err = BR_FAILED_REPLY;
 		goto failed_write;
@@ -1562,6 +1587,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		notifier = kmalloc(sizeof(*notifier), GFP_KERNEL);
 		if (!notifier)
 			return -ENOMEM;
+
 		notifier->event = BINDER_EVT_OBJ_DEAD;	// TODO: the only event (hard-coded)
 		notifier->cookie = msg->cookie;
 		notifier->to_notify = msg->reply_to;
@@ -1570,6 +1596,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		list_add_tail(&notifier->list, &obj->notifiers);
 		spin_unlock(&obj->lock);
 
+printk("pid %d/%d (tid %d/%d) added DEAD_BINDER notifier for binder %p with cookie %p - should send to queue %lu\n", proc->pid, task_tgid_vnr(current), thread->pid, task_pid_vnr(current), msg->binder, msg->cookie, msg->reply_to);
 		kfree(msg);
 	} else {
 		struct binder_notifier *next;
@@ -1578,8 +1605,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		spin_lock(&obj->lock);
 		list_for_each_entry_safe(notifier, next, &obj->notifiers, list) {
 			if (notifier->event == BINDER_EVT_OBJ_DEAD &&
-			    notifier->cookie == msg->cookie &&
-			    notifier->to_notify == msg->reply_to) {
+			    notifier->cookie == msg->cookie) {
 				found = 1;
 				list_del(&notifier->list);
 				break;
@@ -1626,6 +1652,7 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 	    put_user(cookie, (uint32_t *)((char *)buf + sizeof(cmd))))
 		return -EFAULT;
 
+printk("pid %d/%d (tid %d/%d) read DEAD_BINDER command with cookie %08x\n", proc->pid, task_tgid_vnr(current), thread->pid, task_pid_vnr(current), cookie);
 	kfree(*pmsg);
 	*pmsg = NULL;
 	return sizeof(cmd) * 2;
@@ -1646,6 +1673,7 @@ static long bcmd_read_dead_reply(struct binder_proc *proc, struct binder_thread 
 	if (put_user(cmd, (uint32_t *)buf))
 		return -EFAULT;
 
+printk("pid %d (tid %d) read DEAD_REPLY command\n", proc->pid, thread->pid);
 	kfree(*pmsg);
 	*pmsg = NULL;
 	return sizeof(cmd);
@@ -1686,6 +1714,7 @@ static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *th
 	}
 
 	if (cmd) {
+printk("pid %d (tid %d) read %s binder command on object %p/%p\n", proc->pid, thread->pid, cmd==BR_ACQUIRE?"ACQUIRE":"RELEASE", msg->binder, msg->cookie);
 		ref_cmd.cmd = cmd;
 		ref_cmd.binder = msg->binder;
 		ref_cmd.cookie = msg->cookie;
@@ -2064,7 +2093,11 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (proc->ustart || proc->slob)	// TODO: free existing slob?
 		return -EBUSY;
 
-	proc->slob = fast_slob_create(size);
+	/* compat: sericemanager has a map size of 128K and the rest uses (1024-2)k */
+	if (size < 512 * 1024)
+		proc->slob = fast_slob_create(size, 16 * 1024, 4, 2);
+	else
+		proc->slob = fast_slob_create(size, 64 * 1024, 3, 4);
 	if (!proc->slob)
 		return -ENOMEM;
 
