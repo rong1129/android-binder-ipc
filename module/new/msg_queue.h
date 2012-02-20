@@ -31,10 +31,13 @@
 
 struct msg_queue;
 
+typedef unsigned long msg_queue_id;
 typedef void (*queue_release_handler)(struct msg_queue *q, void *);
 
 
 struct msg_queue {
+	msg_queue_id id;
+
 	spinlock_t lock;
 	int active;
 	
@@ -55,7 +58,7 @@ struct msg_queue {
 extern struct msg_queue *create_msg_queue(size_t max_msgs, queue_release_handler handler, void *data);
 extern int free_msg_queue(struct msg_queue *q);
 
-extern int get_msg_queue(struct msg_queue *q);
+extern struct msg_queue *get_msg_queue(msg_queue_id id);
 extern int put_msg_queue(struct msg_queue *q);
 
 extern int write_msg_queue(struct msg_queue *q, struct list_head *msg);
@@ -64,6 +67,8 @@ extern int write_msg_queue_head(struct msg_queue *q, struct list_head *msg);
 extern int read_msg_queue(struct msg_queue *q, struct list_head **pmsg);
 extern int read_msg_queue_tail(struct msg_queue *q, struct list_head **pmsg);
 
+
+#define msg_queue_id(q)		(q)->id
 
 /* Following inline functions should be called either by the queue owner or
  * with a reference held via a call to get_msg_queue() previously

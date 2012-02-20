@@ -23,42 +23,54 @@
 
 static DEFINE_SPINLOCK(g_queue_lock);
 static struct rb_root g_queue_tree = RB_ROOT;
+static msg_queue_id g_queue_seq;
 
 
-static inline void rb_insert_queue(struct rb_node *node)
+static inline void rb_insert_queue(struct msg_queue *new)
 {
-	struct rb_node **p = &g_queue_tree.rb_node;
-	struct rb_node *parent = NULL;
+	struct rb_node *parent, **p;
+	struct msg_queue *q;
+	msg_queue_id id;
+
+retry:
+	id = ++g_queue_seq;
+	p = &g_queue_tree.rb_node;
+	parent = NULL;
 
 	while (*p) {
 		parent = *p;
-		if (node < parent)
+		q = container_of(parent, struct msg_queue, rb_node);
+
+		if (id < q->id)
 			p = &(*p)->rb_left;
-		else if (node > parent)
+		else if (id > q->id)
 			p = &(*p)->rb_right;
 		else
-			BUG();
+			goto retry;
 	}
 
-	rb_link_node(node, parent, p);
-	rb_insert_color(node, &g_queue_tree);
+	new->id = id;
+	rb_link_node(&new->rb_node, parent, p);
+	rb_insert_color(&new->rb_node, &g_queue_tree);
 }
 
-static inline int rb_queue_exist(struct msg_queue *q)
+static inline struct msg_queue *rb_queue_exist(msg_queue_id id)
 {
-	struct rb_node *node = &q->rb_node;
 	struct rb_node *n = g_queue_tree.rb_node;
+	struct msg_queue *q;
 
 	while (n) {
-		if (node < n)
+		q = container_of(n, struct msg_queue, rb_node);
+
+		if (id < q->id)
 			n = n->rb_left;
-		else if (node > n)
+		else if (id > q->id)
 			n = n->rb_right;
 		else
-			return 1;
+			return q;
 	}
 
-	return 0;
+	return NULL;
 }
 
 struct msg_queue *create_msg_queue(size_t max_msgs, queue_release_handler handler, void *data)
@@ -83,7 +95,7 @@ struct msg_queue *create_msg_queue(size_t max_msgs, queue_release_handler handle
 	q->private = data;
 
 	spin_lock(&g_queue_lock);
-	rb_insert_queue(&q->rb_node);
+	rb_insert_queue(q);
 	spin_unlock(&g_queue_lock);
 	return q;
 }
@@ -94,18 +106,20 @@ int free_msg_queue(struct msg_queue *q)
 	return put_msg_queue(q);
 }
 
-int get_msg_queue(struct msg_queue *q)
+struct msg_queue *get_msg_queue(msg_queue_id id)
 {
+	struct msg_queue *q;
+
 	spin_lock(&g_queue_lock);
-	if (!rb_queue_exist(q)) {
+	if (!(q = rb_queue_exist(id))) {
 		spin_unlock(&g_queue_lock);
-		return -ENODEV;
+		return NULL;
 	}
 
 	q->usage++;
 	spin_unlock(&g_queue_lock);
 
-	return 0;
+	return q;
 }
 
 int put_msg_queue(struct msg_queue *q)

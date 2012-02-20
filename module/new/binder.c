@@ -42,7 +42,9 @@
 #define OBJ_HASH_BUCKET_SIZE			128
 #define MAX_TRACE_DEPTH				4
 #define MSG_BUF_ALIGN(n)			(((n) & (sizeof(void *) - 1)) ? ALIGN((n), sizeof(void *)) : (n))
-#define DUMP_MSG(pid, tid, wrt, msg)		//_dump_msg(pid, tid, wrt, msg)
+#define OBJ_IS_BINDER(o)			((o)->owner_queue)
+#define OBJ_IS_HANDLE(o)			(!OBJ_IS_BINDER(o))
+#define DUMP_MSG(pid, tid, wrt, msg)		_dump_msg(pid, tid, wrt, msg)
 
 
 enum {	// compat: review looper idea
@@ -101,11 +103,13 @@ struct binder_notifier {
 	struct list_head list;
 	int event;
 	void *cookie;
-	struct msg_queue *to_notify;
+	msg_queue_id to_notify;
 };
 
 struct binder_obj {
-	void *owner;
+	msg_queue_id owner;
+	struct msg_queue *owner_queue;
+
 	void *binder;
 	void *cookie;
 
@@ -143,12 +147,12 @@ struct bcmd_msg_buf {
 	size_t offsets_size;
 	size_t buf_size;
 
-	struct msg_queue *owners[0];	// owners of the flatten objects
+	msg_queue_id owners[0];		// owners of objects in this buffer
 };
 
 struct bcmd_msg_trace {
-	struct msg_queue *caller_proc;
-	struct msg_queue *caller_thread;
+	msg_queue_id caller_proc;
+	msg_queue_id caller_thread;
 };
 
 struct bcmd_msg {
@@ -166,7 +170,7 @@ struct bcmd_msg {
 	pid_t sender_pid;
 	uid_t sender_euid;
 
-	struct msg_queue *reply_to;
+	msg_queue_id reply_to;
 
 	int trace_depth;
 	struct bcmd_msg_trace traces[MAX_TRACE_DEPTH];
@@ -181,7 +185,7 @@ struct slob_buf {
 };
 
 struct debugfs_priv {
-	struct msg_queue *owner;
+	msg_queue_id owner;
 	struct binder_proc *proc;
 	unsigned long data;
 	struct list_head list;
@@ -199,7 +203,7 @@ static struct debugfs_priv *debugfs_new_thread(struct binder_proc *proc, struct 
 static struct debugfs_priv *debugfs_new_obj(struct binder_proc *proc, struct binder_obj *obj);
 
 
-static inline int binder_cmp(void *owner0, void *binder0, void *owner1, void *binder1)
+static inline int binder_cmp(msg_queue_id owner0, void *binder0, msg_queue_id owner1, void *binder1)
 {
 	ssize_t sign;
 
@@ -212,7 +216,7 @@ static inline int binder_cmp(void *owner0, void *binder0, void *owner1, void *bi
 	return 0;
 }
 
-static struct binder_obj *binder_find_obj(struct binder_proc *proc, void *owner, void *binder)
+static struct binder_obj *binder_find_obj(struct binder_proc *proc, msg_queue_id owner, void *binder)
 {
 	struct rb_node **p = &proc->obj_tree.rb_node;
 	struct rb_node *parent = NULL;
@@ -241,7 +245,7 @@ static struct binder_obj *binder_find_obj(struct binder_proc *proc, void *owner,
 
 static inline struct binder_obj *binder_find_my_obj(struct binder_proc *proc, void *binder)
 {
-	return binder_find_obj(proc, proc->queue, binder);
+	return binder_find_obj(proc, msg_queue_id(proc->queue), binder);
 }
 
 static struct binder_obj *binder_find_obj_by_ref(struct binder_proc *proc, unsigned long ref)
@@ -264,7 +268,7 @@ static struct binder_obj *binder_find_obj_by_ref(struct binder_proc *proc, unsig
 	return NULL;
 }
 
-static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner, void *binder, void *cookie)
+static struct binder_obj *_binder_new_obj(struct binder_proc *proc, msg_queue_id owner, struct msg_queue *owner_queue, void *binder, void *cookie)
 {
 	struct rb_node **p = &proc->obj_tree.rb_node;
 	struct rb_node *parent = NULL;
@@ -277,6 +281,7 @@ static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner,
 		return NULL;
 
 	new_obj->owner = owner;
+	new_obj->owner_queue = owner_queue;
 	new_obj->binder = binder;
 	new_obj->cookie = cookie;
 	spin_lock_init(&new_obj->lock);
@@ -326,7 +331,7 @@ static struct binder_obj *_binder_new_obj(struct binder_proc *proc, void *owner,
 
 static inline struct binder_obj *binder_new_obj(struct binder_proc *proc, void *binder, void *cookie)
 {
-	return _binder_new_obj(proc, proc->queue, binder, cookie);
+	return _binder_new_obj(proc, msg_queue_id(proc->queue), proc->queue, binder, cookie);
 }
 
 // used by the queue owner
@@ -342,12 +347,13 @@ inline int _bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
 }
 
 // used by any process
-inline int bcmd_read_msg(struct msg_queue *q, struct bcmd_msg **pmsg)
+inline int bcmd_read_msg(msg_queue_id id, struct bcmd_msg **pmsg)
 {
+	struct msg_queue *q;
 	int r;
 
-	if (get_msg_queue(q) < 0)
-		return -EFAULT;
+	if (!(q = get_msg_queue(id)))
+		return -ENODEV;
 
 	r = _bcmd_read_msg(q, pmsg);
 
@@ -362,12 +368,13 @@ inline int _bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
 }
 
 // used by any process
-inline int bcmd_write_msg(struct msg_queue *q, struct bcmd_msg *msg)
+inline int bcmd_write_msg(msg_queue_id id, struct bcmd_msg *msg)
 {
+	struct msg_queue *q;
 	int r;
 
-	if (get_msg_queue(q) < 0)
-		return -EFAULT;
+	if (!(q = get_msg_queue(id)))
+		return -ENODEV;
 
 	r = _bcmd_write_msg(q, msg);
 
@@ -382,12 +389,13 @@ inline int _bcmd_write_msg_head(struct msg_queue *q, struct bcmd_msg *msg)
 }
 
 // used by any process
-inline int bcmd_write_msg_head(struct msg_queue *q, struct bcmd_msg *msg)
+inline int bcmd_write_msg_head(msg_queue_id id, struct bcmd_msg *msg)
 {
+	struct msg_queue *q;
 	int r;
 
-	if (get_msg_queue(q) < 0)
-		return -EFAULT;
+	if (!(q = get_msg_queue(id)))
+		return -ENODEV;
 
 	r = _bcmd_write_msg_head(q, msg);
 
@@ -402,7 +410,7 @@ static struct bcmd_msg *binder_alloc_msg(size_t data_size, size_t offsets_size)
 	struct bcmd_msg_buf *mbuf;
 
 	num_objs = offsets_size / sizeof(size_t);
-	msg_buf_size = sizeof(*mbuf) + num_objs * sizeof(struct msg_queue *);
+	msg_buf_size = sizeof(*mbuf) + num_objs * sizeof(msg_queue_id);
 	msg_size = sizeof(*msg) + msg_buf_size;
 	buf_size = msg_size + MSG_BUF_ALIGN(data_size) + MSG_BUF_ALIGN(offsets_size);
 
@@ -429,7 +437,7 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	struct bcmd_msg_buf *mbuf = msg->buf;
 
 	num_objs = offsets_size / sizeof(size_t);
-	msg_buf_size = sizeof(*mbuf) + num_objs * sizeof(struct msg_queue *);
+	msg_buf_size = sizeof(*mbuf) + num_objs * sizeof(msg_queue_id);
 	msg_size = sizeof(*msg) + msg_buf_size;
 	buf_size = msg_size + MSG_BUF_ALIGN(data_size) + MSG_BUF_ALIGN(offsets_size);
 
@@ -489,7 +497,7 @@ void _hexdump(const void *buf, unsigned long size)
 void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
 {
 	printk("proc %d (tid %d) %s %s message:\n", pid, tid, write ? "write" : "read", (msg->type == BC_REPLY) ? "reply" : "transaction");
-	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %p\n", 
+	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %ld\n", 
 		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
 
 	if (msg->buf) {
@@ -515,8 +523,9 @@ static void msg_queue_release(struct msg_queue *q, void *data)
 	while ((entry = msg_queue_pop(q))) {
 		msg = container_of(entry, struct bcmd_msg, list);
 
-		if (msg->type == BC_TRANSACTION) {
-			msg->type = BR_DEAD_BINDER;
+		//TODO: call free buffer
+		if ((msg->type == BC_TRANSACTION) && !(msg->flags & TF_ONE_WAY)) {
+			msg->type = BR_DEAD_REPLY;
 			if (!bcmd_write_msg(msg->reply_to, msg))
 				continue;
 		}
@@ -604,7 +613,7 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 		return NULL;
 
 	new_thread->queue = create_msg_queue(0, msg_queue_release, NULL);
-	if (!new_thread->queue || get_msg_queue(proc->queue) < 0) {
+	if (!new_thread->queue || !get_msg_queue(msg_queue_id(proc->queue))) {
 		kfree(new_thread);
 		return NULL;
 	}
@@ -684,9 +693,7 @@ static int binder_free_thread(struct binder_proc *proc, struct binder_thread *th
 	list_for_each_entry_safe(msg, next, &thread->incoming_transactions, list) {
 		list_del(&msg->list);
 
-		msg->type = BR_DEAD_BINDER;
-
-		BUG_ON(!msg->reply_to);
+		msg->type = BR_DEAD_REPLY;
 		if (bcmd_write_msg(msg->reply_to, msg) < 0)
 			kfree(msg);
 	}
@@ -726,7 +733,7 @@ static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 {
 	debugfs_remove(obj->info_node);
 
-	if (obj->owner == proc->queue) {
+	if (OBJ_IS_BINDER(obj)) {
 		struct binder_notifier *notifier, *next;
 		struct bcmd_msg *msg = NULL;
 
@@ -809,7 +816,7 @@ static int binder_free_proc(struct binder_proc *proc)
 static inline int binder_acquire_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
 {
 	int refs = atomic_inc_return(&obj->refs);
-printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, obj->owner==proc->queue?"binder" :"handle", obj->binder, obj->cookie, refs);
+printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder" :"handle", obj->binder, obj->cookie, refs);
 
 	if (refs == 1) {
 		struct bcmd_msg *msg; 
@@ -822,7 +829,7 @@ printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, obj
 		msg->binder = obj->binder;
 		msg->cookie = obj->cookie;
 
-		if (obj->owner == proc->queue) {
+		if (OBJ_IS_BINDER(obj)) {
 			msg->type = BR_ACQUIRE;
 			r = _bcmd_write_msg(thread->queue, msg); // owner thread should receive BR_ACQUIRE
 		} else {
@@ -842,7 +849,7 @@ printk("pid %d (tid %d) %s %p/%p increased to %d\n", proc->pid, thread->pid, obj
 static inline int binder_release_obj(struct binder_proc *proc, struct binder_thread *thread, struct binder_obj *obj)
 {
 	int refs = atomic_dec_return(&obj->refs);
-printk("pid %d (tid %d) %s %p/%p decreased to %d\n", proc->pid, thread->pid,  obj->owner==proc->queue?"binder" :"handle", obj->binder, obj->cookie, refs);
+printk("pid %d (tid %d) %s %p/%p decreased to %d\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder" :"handle", obj->binder, obj->cookie, refs);
 
 	if (refs == 0) {
 		struct bcmd_msg *msg; 
@@ -855,7 +862,7 @@ printk("pid %d (tid %d) %s %p/%p decreased to %d\n", proc->pid, thread->pid,  ob
 		msg->binder = obj->binder;
 		msg->cookie = obj->cookie;
 
-		if (obj->owner == proc->queue) {
+		if (OBJ_IS_BINDER(obj)) {
 			msg->type = BR_RELEASE;
 			r = _bcmd_write_msg(thread->queue, msg);
 		} else {
@@ -878,7 +885,7 @@ printk("pid %d (tid %d) %s %p/%p decreased to %d\n", proc->pid, thread->pid,  ob
 	return refs;
 }
 
-static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue **owner)
+static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, msg_queue_id *owner)
 {
 	struct binder_obj *obj;
 	struct file *file;
@@ -895,6 +902,7 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 					return -ENOMEM;
 			} else if (bp->cookie != obj->cookie)
 				return -EINVAL;
+
 			*owner = obj->owner;
 
 			r = binder_acquire_obj(proc, thread, obj);
@@ -921,8 +929,9 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 			file = fget(bp->handle);
 			if (!file)
 				return -EINVAL;
+
 			bp->binder = file;
-			*owner = NULL;		// unused
+			*owner = 0;		// unused
 			break;
 
 		default: 
@@ -932,7 +941,7 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 	return 0;
 }
 
-static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, struct msg_queue *owner)
+static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, msg_queue_id owner)
 {
 	struct binder_obj *obj;
 	struct file *file;
@@ -946,12 +955,12 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 		case BINDER_TYPE_WEAK_HANDLE:
 			obj = binder_find_obj(proc, owner, bp->binder);
 			if (!obj) {
-				obj = _binder_new_obj(proc, owner, bp->binder, bp->cookie);
+				obj = _binder_new_obj(proc, owner, NULL, bp->binder, bp->cookie);
 				if (!obj)
 					return -ENOMEM;
 			}
 
-			if (owner == proc->queue) {
+			if (OBJ_IS_BINDER(obj)) {
 				if (type == BINDER_TYPE_HANDLE)
 					bp->type = BINDER_TYPE_BINDER;
 				else if (type == BINDER_TYPE_WEAK_HANDLE)
@@ -988,6 +997,7 @@ static int bcmd_read_flat_obj(struct binder_proc *proc, struct binder_thread *th
 				fput(file);
 				return -ENOMEM;
 			}
+
 			fd_install(fd, file);
 			bp->handle = fd;	// TODO: fput() when free unread msg!!!
 			break;
@@ -1050,8 +1060,8 @@ static inline int bcmd_fill_traces(struct binder_proc *proc, struct binder_threa
 	struct bcmd_msg *trace_msg;
 	int n, i;
 
-	traces[0].caller_proc = proc->queue;
-	traces[0].caller_thread = thread->queue;
+	traces[0].caller_proc = msg_queue_id(proc->queue);
+	traces[0].caller_thread = msg_queue_id(thread->queue);
 	n = 1;
 
 	list_for_each_entry(trace_msg, &thread->incoming_transactions, list) {
@@ -1070,15 +1080,15 @@ static inline int bcmd_fill_traces(struct binder_proc *proc, struct binder_threa
 	return 0;
 }
 
-static inline int bcmd_lookup_caller(struct binder_proc *proc, struct binder_thread *thread, struct msg_queue **dest)
+static inline int bcmd_lookup_caller(struct binder_proc *proc, struct binder_thread *thread, msg_queue_id *dest)
 {
-	struct msg_queue *proc_dest = *dest;
 	struct bcmd_msg *trace_msg;
+	msg_queue_id caller_proc = *dest;
 	int i;
 
 	list_for_each_entry(trace_msg, &thread->incoming_transactions, list) {
 		for (i = 0; i < trace_msg->trace_depth; i++) {
-			if (trace_msg->traces[i].caller_proc == proc_dest) {
+			if (trace_msg->traces[i].caller_proc == caller_proc) {
 				*dest = trace_msg->traces[i].caller_thread;
 				return 1;
 			}
@@ -1091,7 +1101,7 @@ static inline int bcmd_lookup_caller(struct binder_proc *proc, struct binder_thr
 static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_transaction_data *tdata, uint32_t bcmd)
 {
 	struct bcmd_msg *msg;
-	struct msg_queue *q;
+	msg_queue_id to_id;
 	void *binder, *cookie;
 	uint32_t err;
 
@@ -1116,8 +1126,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 
 		bcmd_fill_traces(proc, thread, msg);
 
-		q = obj->owner;
-		bcmd_lookup_caller(proc, thread, &q);
+		to_id = obj->owner;
+		bcmd_lookup_caller(proc, thread, &to_id);
 
 		binder = obj->binder;
 		cookie = obj->cookie;
@@ -1130,7 +1140,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		msg = list_first_entry(&thread->incoming_transactions, struct bcmd_msg, list);
 		list_del(&msg->list);
 
-		q = msg->reply_to;
+		to_id = msg->reply_to;
 		binder = cookie = NULL;		// compat
 
 		msg = binder_realloc_msg(msg, tdata->data_size, tdata->offsets_size);
@@ -1147,7 +1157,7 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	msg->flags = tdata->flags;
 	msg->sender_pid = proc->pid;
 	msg->sender_euid = current->cred->euid;
-	msg->reply_to = thread->queue;	// reply queue & indicating source
+	msg->reply_to = msg_queue_id(thread->queue);	// reply queue & indicating source
 
 	if (tdata->data_size > 0) {
 		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0) {
@@ -1157,8 +1167,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	}
 	DUMP_MSG(proc->pid, thread->pid, 1, msg);
 
-	if (bcmd_write_msg(q, msg) < 0) {
-		err = BR_DEAD_REPLY;
+	if (bcmd_write_msg(to_id, msg) < 0) {
+		err = BR_FAILED_REPLY;
 		goto failed_write;
 	}
 
@@ -1226,7 +1236,7 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 				continue;
 
 			if (obj) {
-printk("pid %d (tid %d) free %s %p/%p in the buffer\n", proc->pid, thread->pid, obj->owner==proc->queue?"binder":"handle", obj->binder, obj->cookie);
+printk("pid %d (tid %d) free %s %p/%p in the buffer\n", proc->pid, thread->pid, OBJ_IS_BINDER(obj)?"binder":"handle", obj->binder, obj->cookie);
 				binder_release_obj(proc, thread, obj);
 			}
 		}
@@ -1252,7 +1262,7 @@ static int bcmd_write_acquire(struct binder_proc *proc, struct binder_thread *th
 	if (!obj)
 		return -1;
 
-printk("pid %d (tid %d) %s %s %p/%p, refs now %d\n", proc->pid, thread->pid, bcmd==BC_ACQUIRE? "acquire" : "release", obj->owner==proc->queue?"binder":"handle", obj->binder, obj->cookie, atomic_read(&obj->refs));
+printk("pid %d (tid %d) %s %s %p/%p, refs now %d\n", proc->pid, thread->pid, bcmd==BC_ACQUIRE? "acquire" : "release", OBJ_IS_BINDER(obj)?"binder":"handle", obj->binder, obj->cookie, atomic_read(&obj->refs));
 	/* For user generated ACQUIRE/RELEASE, we don't send BR_* back, as the reference
 	   has already been acquired when the reference object was created. */
 	if (bcmd == BC_ACQUIRE)
@@ -1288,10 +1298,10 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	msg->cookie = notifier->cookie;
 
 	// dead_binder sent to the process queue, while clear_notifcation_done sent to the request thread
-	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? proc->queue : thread->queue;
+	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? msg_queue_id(proc->queue) : msg_queue_id(thread->queue);
 
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
-		err = BR_DEAD_REPLY;
+		err = BR_FAILED_REPLY;
 		goto failed_write;
 	}
 
@@ -1629,6 +1639,26 @@ static long bcmd_read_dead_binder(struct binder_proc *proc, struct binder_thread
 	return sizeof(cmd) * 2;
 }
 
+static long bcmd_read_dead_reply(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
+{
+	uint32_t cmd = (*pmsg)->type;
+
+	if (size < sizeof(cmd))
+		return -ENOSPC;
+
+	if (thread->pending_replies > 0) {
+		thread->pending_replies--;
+		//TODO: wakeup
+	}
+
+	if (put_user(cmd, (uint32_t *)buf))
+		return -EFAULT;
+
+	kfree(*pmsg);
+	*pmsg = NULL;
+	return sizeof(cmd);
+}
+
 static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_msg **pmsg, void __user *buf, unsigned long size)
 {
 	struct bcmd_msg *msg = *pmsg;
@@ -1658,7 +1688,7 @@ static long bcmd_read_acquire(struct binder_proc *proc, struct binder_thread *th
 printk("pid %d (tid %d) binder %p/%p increased to %d on command read\n", proc->pid, thread->pid, obj->binder, obj->cookie, atomic_read(&obj->refs));
 		} else {
 			if (atomic_dec_return(&obj->refs) == 0) {
-				cmd = BR_RELEASE;
+				cmd = 0;//BR_RELEASE;
 printk("pid %d (tid %d) binder %p/%p decreased to 0 on command read\n", proc->pid, thread->pid, obj->binder, obj->cookie);
 				binder_free_obj(proc, obj);
 			} else
@@ -1667,6 +1697,7 @@ printk("pid %d (tid %d) binder %p/%p decreased to %d on command read\n", proc->p
 	}
 
 	if (cmd) {
+printk("pid %d (tid %d) binder %p/%p %s returned to user !!!!!!!!!!!!!!!! \n", proc->pid, thread->pid, msg->binder, msg->cookie, cmd==BR_ACQUIRE?"acquire":"release");
 		ref_cmd.cmd = cmd;
 		ref_cmd.binder = msg->binder;
 		ref_cmd.cookie = msg->cookie;
@@ -1693,7 +1724,8 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 
 	n = msg_queue_size(proc->queue);
 
-	if ((atomic_read(&proc->proc_loopers) < n) && (atomic_read(&proc->registered_loopers) < proc->max_threads) &&
+	if ((atomic_read(&proc->proc_loopers) < n) &&
+	    (atomic_read(&proc->registered_loopers) < proc->max_threads) &&
 	    !atomic_read(&proc->requested_loopers)) {
 		if (put_user(cmd, (uint32_t *)buf))
 			return -EFAULT;
@@ -1778,17 +1810,22 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 					force_return = 1;
 				break;
 
-			case BR_DEAD_BINDER:
-				n = bcmd_read_dead_binder(proc, thread, &msg, p, size);
-				force_return = 1;
-				break;
-
 			case BC_REQUEST_DEATH_NOTIFICATION:
 			case BC_CLEAR_DEATH_NOTIFICATION:
 			case BR_CLEAR_DEATH_NOTIFICATION_DONE:
 				n = bcmd_read_notifier(proc, thread, &msg, p, size);
 				if (n > 0)
 					force_return = 1;
+				break;
+
+			case BR_DEAD_BINDER:
+				n = bcmd_read_dead_binder(proc, thread, &msg, p, size);
+				force_return = 1;
+				break;
+
+			case BR_DEAD_REPLY:
+				n = bcmd_read_dead_reply(proc, thread, &msg, p, size);
+				force_return = 1;
 				break;
 
 			default:
@@ -1909,7 +1946,7 @@ static int binder_release(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc = filp->private_data;
 
-	if (context_mgr_obj && context_mgr_obj->owner == proc->queue) 
+	if (context_mgr_obj && (context_mgr_obj->owner_queue == proc->queue)) 
 		context_mgr_obj = NULL;
 
 	// TODO: make sure existing referencing context_mgr_obj is safe
@@ -2064,21 +2101,22 @@ static int debugfs_proc_info(struct seq_file *seq, void *start)
 {	
 	struct debugfs_priv *priv = seq->private;
 	struct binder_proc *proc;
+	struct msg_queue *q;
 
-	if (get_msg_queue(priv->owner) < 0)
+	if (!(q = get_msg_queue(priv->owner)))
 		return -ENODEV;
 
 	proc = priv->proc;
 
 	seq_printf(seq, "pid: %d\n", proc->pid);
-	seq_printf(seq, "queue: %p\n", proc->queue);
+	seq_printf(seq, "qid: %ld\n", msg_queue_id(proc->queue));
 	seq_printf(seq, "obj_seq: %lu\n", proc->obj_seq);
 	seq_printf(seq, "max_threads: %d\n", proc->max_threads);
 	seq_printf(seq, "registered_loopers: %d\n", atomic_read(&proc->registered_loopers));
 	seq_printf(seq, "proc_loopers: %d\n", atomic_read(&proc->proc_loopers));
 	seq_printf(seq, "requested_loopers: %d\n", atomic_read(&proc->requested_loopers));
 
-	put_msg_queue(priv->owner);
+	put_msg_queue(q);
 	return 0;
 }
 
@@ -2090,8 +2128,9 @@ static int debugfs_thread_info(struct seq_file *seq, void *start)
 	struct rb_node **p;
 	struct rb_node *parent = NULL;
 	struct binder_thread *thread;
+	struct msg_queue *q;
 
-	if (get_msg_queue(priv->owner) < 0)
+	if (!(q = get_msg_queue(priv->owner)))
 		return -ENODEV;
 
 	proc = priv->proc;
@@ -2112,12 +2151,12 @@ static int debugfs_thread_info(struct seq_file *seq, void *start)
 	}
 	spin_unlock(&proc->lock);
 
-	put_msg_queue(priv->owner);
+	put_msg_queue(q);
 	return -ENODEV;
 	
 seq_show:
 	seq_printf(seq, "pid: %d\n", thread->pid);
-	seq_printf(seq, "queue: %p\n", thread->queue);
+	seq_printf(seq, "qid: %ld\n", msg_queue_id(thread->queue));
 	seq_printf(seq, "state: %d\n", thread->state);
 	seq_printf(seq, "non_block: %d\n", thread->non_block);
 	seq_printf(seq, "last_error: %x\n", thread->last_error);
@@ -2126,7 +2165,7 @@ seq_show:
 
 	spin_unlock(&proc->lock);
 
-	put_msg_queue(priv->owner);
+	put_msg_queue(q);
 	return 0;
 }
 
@@ -2138,8 +2177,9 @@ static int debugfs_obj_info(struct seq_file *seq, void *start)
 	struct binder_obj *obj;
 	struct hlist_head *head;
 	struct hlist_node *node;
+	struct msg_queue *q;
 
-	if (get_msg_queue(priv->owner) < 0)
+	if (!(q = get_msg_queue(priv->owner)))
 		return -ENODEV;
 
 	proc = priv->proc;
@@ -2155,13 +2195,13 @@ static int debugfs_obj_info(struct seq_file *seq, void *start)
 
 	spin_unlock(&proc->obj_lock);
 
-	put_msg_queue(priv->owner);
+	put_msg_queue(q);
 	return -ENODEV;
 
 seq_show:
 	seq_printf(seq, "ref: %lu\n", obj->ref);
-	seq_printf(seq, "type: %s\n", (obj->owner == proc->queue) ? "binder" : "handle");
-	seq_printf(seq, "owner: %p\n", obj->owner);
+	seq_printf(seq, "type: %s\n", OBJ_IS_BINDER(obj) ? "binder" : "handle");
+	seq_printf(seq, "owner: %ld\n", obj->owner);
 	seq_printf(seq, "binder: %p\n", obj->binder);
 	seq_printf(seq, "cookie: %p\n", obj->cookie);
 	seq_printf(seq, "refs: %d\n", atomic_read(&obj->refs));
@@ -2169,7 +2209,7 @@ seq_show:
 
 	spin_unlock(&proc->obj_lock);
 
-	put_msg_queue(priv->owner);
+	put_msg_queue(q);
 	return 0;
 }
 
@@ -2221,7 +2261,7 @@ static struct debugfs_priv *debugfs_new_proc(struct binder_proc *proc)
 	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		goto no_mem;
-	priv->owner = proc->queue;
+	priv->owner = msg_queue_id(proc->queue);
 	priv->proc = proc;
 
 	sprintf(str, "%d", proc->pid);
@@ -2271,7 +2311,7 @@ static struct debugfs_priv *debugfs_new_thread(struct binder_proc *proc, struct 
 	if (!priv)
 		return NULL;
 
-	priv->owner = proc->queue;
+	priv->owner = msg_queue_id(proc->queue);
 	priv->proc = proc;
 	priv->data = (unsigned long)thread->pid;
 
@@ -2294,7 +2334,7 @@ static struct debugfs_priv *debugfs_new_obj(struct binder_proc *proc, struct bin
 	if (!priv)
 		return NULL;
 
-	priv->owner = proc->queue;
+	priv->owner = msg_queue_id(proc->queue);
 	priv->proc = proc;
 	priv->data = obj->ref;
 
