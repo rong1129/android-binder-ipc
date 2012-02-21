@@ -501,7 +501,6 @@ static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 			msg->type = BR_DEAD_BINDER;
 			msg->binder = obj->binder;
 			msg->cookie = notifier->cookie;
-printk("pid %d (tid *) send DEAD_BINDER to queue %lu for binder %p with cookie %p\n", proc->pid, notifier->to_notify, msg->binder, msg->cookie);
 			if (!bcmd_write_msg(notifier->to_notify, msg))
 				msg = NULL;
 
@@ -512,7 +511,7 @@ printk("pid %d (tid *) send DEAD_BINDER to queue %lu for binder %p with cookie %
 	} else {
 		// reference - tell the owner we are no longer referencing the object
 		if (atomic_read(&obj->refs) > 0)
-			binder_inform_obj(obj, BR_RELEASE);
+			binder_inform_obj(obj, BC_RELEASE);
 	}
 
 	kfree(obj);
@@ -1317,7 +1316,6 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	// dead_binder sent to the process queue, while clear_notifcation_done sent to the request thread
 	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? msg_queue_id(proc->queue) : msg_queue_id(thread->queue);
 
-printk("pid %d/%d (tid %d/%d) %s DEAD_BINDER notifier for binder %p with cookie %p - should send to queue %lu\n", proc->pid, task_tgid_vnr(current), thread->pid, task_pid_vnr(current), (bcmd == BC_REQUEST_DEATH_NOTIFICATION)?"request":"clear", msg->binder, msg->cookie, msg->reply_to);
 	if (bcmd_write_msg(obj->owner, msg) < 0) {
 		err = BR_FAILED_REPLY;
 		goto failed_write;
@@ -1596,7 +1594,6 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		list_add_tail(&notifier->list, &obj->notifiers);
 		spin_unlock(&obj->lock);
 
-printk("pid %d/%d (tid %d/%d) added DEAD_BINDER notifier for binder %p with cookie %p - should send to queue %lu\n", proc->pid, task_tgid_vnr(current), thread->pid, task_pid_vnr(current), msg->binder, msg->cookie, msg->reply_to);
 		kfree(msg);
 	} else {
 		struct binder_notifier *next;

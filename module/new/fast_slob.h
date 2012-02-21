@@ -156,7 +156,7 @@ static inline void fast_slob_free(struct fast_slob *slob, void *p)
 	int idx;
 
 	if ((idx = fast_slob_bucket(slob, p)) < 0) {
-		printk(KERN_WARNING "fast_slob: try to free with an invalid buffer address %p\n", p);
+		printk(KERN_WARNING "fast_slob: try to free an invalid buffer with address %p\n", p);
 		return;
 	}
 
