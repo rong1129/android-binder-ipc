@@ -204,6 +204,66 @@ static struct debugfs_priv *debugfs_new_thread(struct binder_proc *proc, struct 
 static struct debugfs_priv *debugfs_new_obj(struct binder_proc *proc, struct binder_obj *obj);
 
 
+// TODO: to be deleted
+void _hexdump(const void *buf, unsigned long size)
+{
+	int col = 0, off = 0, n = 0;
+	unsigned char *p = (unsigned char *)buf;
+	char cbuf[64];
+
+	if (size > 256)
+		size = 256;
+	while (size--) {
+		if (!col)
+			printk("\t%08x:", off);
+
+		printk(" %02x", *p);
+		cbuf[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : ' ';
+		cbuf[n++] = ' ';
+
+		p++;
+		off++;
+		col++;
+
+		if (!(col % 16)) {
+			cbuf[n] = '\0';
+			printk("    %s\n", cbuf);
+			n = 0;
+			col = 0;
+		} else if (!(col % 4))
+			printk("  ");
+	}
+
+	if (col % 16) {
+		while (col++ < 16) 
+			printk("    ");
+		cbuf[n] = '\0';
+		printk("  %s\n", cbuf);
+	} else
+		printk("\n");
+}
+
+void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
+{
+	printk("proc %d (tid %d) %s %s message:\n", pid, tid, write ? "write" : "read", (msg->type == BC_REPLY) ? "reply" : "transaction");
+	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %ld\n", 
+		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
+
+	if (msg->buf) {
+		struct bcmd_msg_buf *mbuf = msg->buf;
+
+		if (mbuf->data_size > 0) {
+			printk("\t data size %u\n", mbuf->data_size);
+			_hexdump(mbuf->data, mbuf->data_size);
+
+			if (mbuf->offsets_size > 0) {
+				printk("\t offsets size %u\n", mbuf->offsets_size);
+				_hexdump(mbuf->offsets, mbuf->offsets_size);
+			}
+		}
+	}
+}
+
 static inline int binder_cmp(msg_queue_id owner0, void *binder0, msg_queue_id owner1, void *binder1)
 {
 	ssize_t sign;
@@ -526,65 +586,6 @@ static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 	spin_unlock(&proc->obj_lock);
 
 	return _binder_free_obj(proc, obj);
-}
-
-void _hexdump(const void *buf, unsigned long size)
-{
-	int col = 0, off = 0, n = 0;
-	unsigned char *p = (unsigned char *)buf;
-	char cbuf[64];
-
-	if (size > 256)
-		size = 256;
-	while (size--) {
-		if (!col)
-			printk("\t%08x:", off);
-
-		printk(" %02x", *p);
-		cbuf[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : ' ';
-		cbuf[n++] = ' ';
-
-		p++;
-		off++;
-		col++;
-
-		if (!(col % 16)) {
-			cbuf[n] = '\0';
-			printk("    %s\n", cbuf);
-			n = 0;
-			col = 0;
-		} else if (!(col % 4))
-			printk("  ");
-	}
-
-	if (col % 16) {
-		while (col++ < 16) 
-			printk("    ");
-		cbuf[n] = '\0';
-		printk("  %s\n", cbuf);
-	} else
-		printk("\n");
-}
-
-void _dump_msg(int pid, int tid, int write, struct bcmd_msg *msg)
-{
-	printk("proc %d (tid %d) %s %s message:\n", pid, tid, write ? "write" : "read", (msg->type == BC_REPLY) ? "reply" : "transaction");
-	printk("\tbinder %p, cookie %p, type %u, code %u, flags %u, uid %d, pid %d, queue %ld\n", 
-		msg->binder, msg->cookie, msg->type, msg->code, msg->flags, msg->sender_pid, msg->sender_euid, msg->reply_to);
-
-	if (msg->buf) {
-		struct bcmd_msg_buf *mbuf = msg->buf;
-
-		if (mbuf->data_size > 0) {
-			printk("\t data size %u\n", mbuf->data_size);
-			_hexdump(mbuf->data, mbuf->data_size);
-
-			if (mbuf->offsets_size > 0) {
-				printk("\t offsets size %u\n", mbuf->offsets_size);
-				_hexdump(mbuf->offsets, mbuf->offsets_size);
-			}
-		}
-	}
 }
 
 static void drain_msg_queue(struct binder_proc *proc, struct msg_queue *q)
@@ -1151,7 +1152,11 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		binder = obj->binder;
 		cookie = obj->cookie;
 	} else {
-		// compat: pop out the top transaction without checking
+		/* compat: pop out the top transaction without checking. The big issue
+		   here is the reply message doesn't carry enough information we could use
+		   to check its validity, in particular if there are more than one pending
+		   incoming transactions on the stack waiting to be replied. See comments
+		   in bcmd_read_transaction() */
 		if (list_empty(&thread->incoming_transactions)) {
 			err = BR_FAILED_REPLY;
 			goto failed_transaction;
@@ -1279,8 +1284,6 @@ static int bcmd_write_acquire(struct binder_proc *proc, struct binder_thread *th
 	if (!obj)
 		return -1;
 
-	/* For user generated ACQUIRE/RELEASE, we don't send BR_* back, as the reference
-	   has already been acquired when the reference object was created. */
 	if (bcmd == BC_ACQUIRE)
 		r = binder_acquire_obj(proc, thread, obj);
 	else
@@ -1540,9 +1543,15 @@ static long bcmd_read_transaction(struct binder_proc *proc, struct binder_thread
 
 	if (msg->type == BC_TRANSACTION) {
 		if (!(msg->flags & TF_ONE_WAY)) {
-if (!list_empty(&thread->incoming_transactions)) printk("proc %d (tid %d) has more than one transaction on the stack\n", proc->pid, thread->pid);
-			list_add_tail(&msg->list, &thread->incoming_transactions);
-
+			/* This is where things get nasty. When launching an app, a call scenario can be
+			   1. Launcher calls ActivityManager
+			   2. ActivityManager calls SurfaceComposer
+			   3. SurfaceComposer calls ActivityManager (for permission of frame_buffer)
+			   which causes ActivityManager to have two incoming transactions on the stack. 
+			   It appears that it has to follow a strict FILO order, and requires the application
+			   to follow the same order. Because there's no strict sequencing or alike to enforce
+			   the order, things can easily go wrong. */
+			list_add(&msg->list, &thread->incoming_transactions);
 			msg = NULL;
 		}
 	} else {
@@ -1586,7 +1595,7 @@ static long bcmd_read_notifier(struct binder_proc *proc, struct binder_thread *t
 		if (!notifier)
 			return -ENOMEM;
 
-		notifier->event = BINDER_EVT_OBJ_DEAD;	// TODO: the only event (hard-coded)
+		notifier->event = BINDER_EVT_OBJ_DEAD;
 		notifier->cookie = msg->cookie;
 		notifier->to_notify = msg->reply_to;
 
