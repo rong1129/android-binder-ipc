@@ -1144,10 +1144,11 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 			goto failed_msg;
 		}
 
-		bcmd_fill_traces(proc, thread, msg);
-
 		to_id = obj->owner;
-		bcmd_lookup_caller(proc, thread, &to_id);
+		if (!(tdata->flags & TF_ONE_WAY)) {
+			bcmd_fill_traces(proc, thread, msg);
+			bcmd_lookup_caller(proc, thread, &to_id);
+		}
 
 		binder = obj->binder;
 		cookie = obj->cookie;
