@@ -1,6 +1,6 @@
 all: servicemanager
 
-CFLAGS := -DINLINE_TRANSACTION_DATA 
+#CFLAGS := -DINLINE_TRANSACTION_DATA 
 
 servicemanager: binder.o service_manager.o
 	gcc -o $@ $^

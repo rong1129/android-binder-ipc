@@ -4,7 +4,7 @@ include cutils/Makefile
 include utils/Makefile
 include binder/Makefile
 
-CFLAGS := -I.. -Iinclude -DHAVE_PTHREADS -DHAVE_SYS_UIO_H -DHAVE_ENDIAN_H -DINLINE_TRANSACTION_DATA
+CFLAGS := -I.. -Iinclude -DHAVE_PTHREADS -DHAVE_SYS_UIO_H -DHAVE_ENDIAN_H #-DINLINE_TRANSACTION_DATA
 
 libbinder.a: $(objects)
 	ar cr $@ $^
