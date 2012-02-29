@@ -88,9 +88,8 @@ static inline struct fast_slob *fast_slob_create(size_t size, int max_alloc_size
 		while (start < end) {
 			buf = start;
 			start += ALIGN(min_alloc_size, MIN_ALLOC_SIZE);
-			*(char **)buf = start;
+			*(char **)buf = (start < end) ? start : NULL;
 		}
-		*(char **)buf = NULL;
 
 		min_alloc_size <<= alloc_size_shift;
 	}

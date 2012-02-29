@@ -517,6 +517,30 @@ static struct bcmd_msg *binder_realloc_msg(struct bcmd_msg *msg, size_t data_siz
 	return binder_alloc_msg(data_size, offsets_size);
 }
 
+// used by the queue owner
+static inline int _binder_write_cmd(struct msg_queue *q, void *binder, void *cookie, unsigned int cmd)
+{
+	struct bcmd_msg *msg; 
+	int r;
+
+	msg = binder_alloc_msg(0, 0);
+	if (!msg)
+		return -ENOMEM;
+
+	msg->type = cmd;
+	msg->binder = binder;
+	msg->cookie = cookie;
+
+	r = _bcmd_write_msg(q, msg);
+	if (r < 0) {
+		kfree(msg);
+		return r;
+	}
+
+	return 0;
+}
+
+// used by any process
 static inline int binder_write_cmd(msg_queue_id q, void *binder, void *cookie, unsigned int cmd)
 {
 	struct bcmd_msg *msg; 
@@ -599,7 +623,7 @@ static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj, int
 	return 0;
 }
 
-static int drain_msg_buf(struct binder_proc *proc, struct bcmd_msg *msg)
+static int clear_msg_buf(struct binder_proc *proc, struct bcmd_msg *msg)
 {
 	struct bcmd_msg_buf *mbuf = msg->buf;
 
@@ -641,7 +665,7 @@ static int drain_msg_buf(struct binder_proc *proc, struct bcmd_msg *msg)
 	return 0;
 }
 
-static void drain_msg_queue(struct binder_proc *proc, struct msg_queue *q)
+static void clear_msg_queue(struct binder_proc *proc, struct msg_queue *q)
 {
 	struct list_head *entry;
 	struct bcmd_msg *msg;
@@ -650,7 +674,7 @@ static void drain_msg_queue(struct binder_proc *proc, struct msg_queue *q)
 		msg = container_of(entry, struct bcmd_msg, list);
 
 		if (msg->type == BC_TRANSACTION) {
-			drain_msg_buf(proc, msg);
+			clear_msg_buf(proc, msg);
 
 			if (!(msg->flags & TF_ONE_WAY)) {
 				msg->type = BR_DEAD_REPLY;
@@ -658,7 +682,7 @@ static void drain_msg_queue(struct binder_proc *proc, struct msg_queue *q)
 					continue;
 			}
 		} else if (msg->type == BC_REPLY) {
-			drain_msg_buf(proc, msg);
+			clear_msg_buf(proc, msg);
 		} else if (msg->type == BC_CLEAR_DEATH_NOTIFICATION) {
 			struct binder_obj *obj;
 
@@ -689,7 +713,7 @@ static void thread_queue_release(struct msg_queue *q, void *data)
 	struct binder_proc *proc = thread->proc;
 	struct bcmd_msg *msg, *next;
 
-	drain_msg_queue(proc, q);
+	clear_msg_queue(proc, q);
 
 	list_for_each_entry_safe(msg, next, &thread->incoming_transactions, list) {
 		list_del(&msg->list);
@@ -716,7 +740,7 @@ static void proc_queue_release(struct msg_queue *q, void *data)
 	struct binder_obj *obj;
 	struct debugfs_priv *priv, *next;
 
-	drain_msg_queue(proc, q);
+	clear_msg_queue(proc, q);
 
 	// safe to free objs and send BR_DEAD_BINDER
 	while ((n = rb_first(&proc->obj_tree))) {
@@ -967,9 +991,9 @@ static inline int binder_release_obj(struct binder_proc *proc, struct binder_thr
 
 static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *thread, struct flat_binder_object *bp, msg_queue_id *owner)
 {
+	unsigned long type = bp->type;
 	struct binder_obj *obj;
 	struct file *file;
-	unsigned long type = bp->type;
 	int r;
 
 	switch (type) {
@@ -985,9 +1009,11 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 
 			*owner = obj->owner;
 
-			r = binder_acquire_obj(proc, thread, obj);
-			if (r < 0)
-				return r;
+			if (type == BINDER_TYPE_BINDER) {
+				r = binder_acquire_obj(proc, thread, obj);
+				if (r < 0)
+					return r;
+			}
 			break;
 
 		case BINDER_TYPE_HANDLE:
@@ -1000,9 +1026,11 @@ static int bcmd_write_flat_obj(struct binder_proc *proc, struct binder_thread *t
 			bp->cookie = obj->cookie;
 			*owner = obj->owner;
 
-			r = binder_inform_owner(obj, BC_ACQUIRE);
-			if (r < 0)
-				return r;
+			if (type == BINDER_TYPE_HANDLE) {
+				r = binder_inform_owner(obj, BC_ACQUIRE);
+				if (r < 0)
+					return r;
+			}
 			break;
 
 		case BINDER_TYPE_FD:
@@ -1250,6 +1278,18 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	}
 	DUMP_MSG(proc->pid, thread->pid, 1, msg);
 
+	/* compat: send BR_TRANSACTION_COMPLETE to the calling thread. It has to be written to the
+	   thread queue after the message ('msg') has been assembled, so that the referencing commands
+	   (BR_*, done in bcmd_write_msg_buf()) are ahead of COMPLETE, but before 'msg' is written to
+	   the destination queue. If COMPLETE is written after that, there's a chance that the reply
+	   message (of 'msg') arrives earlier before COMPLETE is enqueued, in which case the framework
+	   will simply treat the reply message as the response and return immediately before draining
+	   COMPLETE. The COMPLETE message left behind will then mess up the next transaction. */
+	if (_binder_write_cmd(thread->queue, msg->binder, msg->cookie, BR_TRANSACTION_COMPLETE) < 0) {
+		err = BR_FAILED_REPLY;
+		goto failed_write;
+	}
+
 	if (bcmd_write_msg(to_id, msg) < 0) {
 		err = BR_FAILED_REPLY;
 		goto failed_write;
@@ -1257,21 +1297,10 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 
 	if (bcmd == BC_TRANSACTION && !(tdata->flags & TF_ONE_WAY))
 		thread->pending_replies++;
-
-	// compat: send BR_TRANSACTION_COMPLETE 
-	msg = binder_alloc_msg(0, 0);
-	if (!msg)
-		return -ENOMEM;
-
-	msg->type = BR_TRANSACTION_COMPLETE;
-	if (_bcmd_write_msg(thread->queue, msg) < 0) {
-		kfree(msg);
-		return -ENOMEM;
-	}
-
 	return 0;
 
 failed_write:
+	clear_msg_buf(proc, msg);
 failed_load:
 	kfree(msg);
 failed_msg:
@@ -1433,13 +1462,13 @@ static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thr
 	return 0;
 }
 
-static long binder_thread_write(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
+static long binder_thread_write(struct binder_proc *proc, struct binder_thread *thread, char __user *buf, char __user *end)
 {
-	void __user *p = buf, *ep = buf + size;
+	char __user *p = buf;
 	uint32_t bcmd;
 	int err = 0;
 
-	while ((p + sizeof(bcmd)) <= ep) {
+	while ((p + sizeof(bcmd)) <= end) {
 		if (get_user(bcmd, (uint32_t *)p))
 			return -EFAULT;
 		p += sizeof(bcmd);
@@ -1449,7 +1478,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 			case BC_REPLY:  {
 				struct bcmd_transaction_data tdata;
 
-				if ((p + sizeof(tdata)) > ep || copy_from_user(&tdata, p, sizeof(tdata)))
+				if ((p + sizeof(tdata)) > end || copy_from_user(&tdata, p, sizeof(tdata)))
 					return -EFAULT;
 				p += sizeof(tdata);
 
@@ -1467,7 +1496,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 			case BC_FREE_BUFFER: {
 				void *buffer;
 
-				if (get_user(buffer, (void __user **)p))
+				if ((p + sizeof(void *)) > end || get_user(buffer, (void __user **)p))
 					return -EFAULT;
 				p += sizeof(void *);
 
@@ -1481,7 +1510,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 			case BC_DECREFS: {
 				void *handle;
 
-				if (get_user(handle, (void __user **)p))
+				if ((p + sizeof(void *)) > end || get_user(handle, (void __user **)p))
 					return -EFAULT;
 				p += sizeof(void *);
 
@@ -1493,7 +1522,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 			case BC_CLEAR_DEATH_NOTIFICATION: {
 				struct bcmd_notifier_data notifier;
 
-				if ((p + sizeof(notifier)) > ep || copy_from_user(&notifier, p, sizeof(notifier)))
+				if ((p + sizeof(notifier)) > end || copy_from_user(&notifier, p, sizeof(notifier)))
 					return -EFAULT;
 				p += sizeof(notifier);
 
@@ -1508,12 +1537,18 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				break;
 
 			case BC_DEAD_BINDER_DONE:
+				if ((p + sizeof(void *)) > end)
+					return -EFAULT;
+
 				// TODO: do something?
 				p += sizeof(void *);
 				break;
 
 			case BC_INCREFS_DONE:
 			case BC_ACQUIRE_DONE:
+				if ((p + 2 * sizeof(void *)) > end)
+					return -EFAULT;
+
 				// TODO: do something?
 				p += 2 * sizeof(void *);
 				break;
@@ -1800,7 +1835,7 @@ obj_removed:
 	return r;
 }
 
-static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsigned long size)
+static int bcmd_spawn_on_busy(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
 {
 	uint32_t cmd = BR_SPAWN_LOOPER;
 	int n;
@@ -1823,11 +1858,12 @@ static int bcmd_spawn_on_busy(struct binder_proc *proc, void __user *buf, unsign
 	return 0;
 }
 
-static long binder_thread_read(struct binder_proc *proc, struct binder_thread *thread, void __user *buf, unsigned long size)
+static long binder_thread_read(struct binder_proc *proc, struct binder_thread *thread, char __user *buf, char __user *end)
 {
 	struct msg_queue *q;
 	struct bcmd_msg *msg = NULL;
-	void __user *p = buf;
+	char __user *p = buf;
+	ssize_t size = end - buf;
 	int proc_looper = 0, force_return = 0;
 	long n;
 
@@ -1844,7 +1880,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 #endif
 
 	if (thread->state & BINDER_LOOPER_STATE_READY) {	// compat: only ready threads can request spawn
-		n = bcmd_spawn_on_busy(proc, p, size);
+		n = bcmd_spawn_on_busy(proc, thread, p, size);
 		if (n)	// spawn or error returned immediately
 			return n;
 	}
@@ -1956,15 +1992,19 @@ static inline int cmd_write_read(struct binder_proc *proc, struct binder_thread 
 {
 	int r;
 
-	if (bwr->write_size > 0) {
-		r = binder_thread_write(proc, thread, (void __user *)bwr->write_buffer + bwr->write_consumed, bwr->write_size);
+	if (bwr->write_size > 0 && bwr->write_consumed < bwr->write_size) {
+		r = binder_thread_write(proc, thread, 
+					(char __user *)bwr->write_buffer + bwr->write_consumed,
+					(char __user *)bwr->write_buffer + bwr->write_size);
 		if (r < 0)
 			return r;
 		bwr->write_consumed += r;
 	}
 
-	if (bwr->read_size > 0) {
-		r = binder_thread_read(proc, thread, (void __user *)bwr->read_buffer + bwr->read_consumed, bwr->read_size);
+	if (bwr->read_size > 0 && bwr->read_consumed < bwr->read_size) {
+		r = binder_thread_read(proc, thread,
+					(char __user *)bwr->read_buffer + bwr->read_consumed, 
+					(char __user *)bwr->read_buffer + bwr->read_size);
 		if (r < 0)
 			return r;
 		bwr->read_consumed += r;
