@@ -1,3 +1,17 @@
+29 Feb 2012
+Just fixed another issue that caused apps crashing on my U8150. It's caused by some not well-thought design details in the binder protocal and framework implementation, see the comments in the source code.
+
+As of today, the new binder driver now runs on Goldfish 4.0.3 (ISC) and U8150 2.2 (Froyo). It's fully compatiable with the old driver (at least everything discovered so far), which means no changes required for the Framework. All you need to do is to apply the patch to the kernel and upload the new kernel to the device.
+
+As always, this is just a start - a nice one though. Further tests, bug fixing and improvements will be on the way.
+
+Todo/Reminder:
+* Priority inheritance to be reviewed and added.
+
+
+
+
+
 17 Feb 2012
 It's been a while since this file was last updated, although the driver has been moving forward all the time.
 
