@@ -1324,8 +1324,8 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 
 	bucket = fast_slob_bucket(proc->slob, sbuf);
 	if (bucket < 0 || (sbuf->uaddr_data != (unsigned long)uaddr)) {
-		printk("binder: pid %d (tid %d) trying to free an invalid buffer %p, bucket %d, %lu\n",
-			proc->pid, thread->pid, uaddr, bucket, sbuf->uaddr_data);
+		printk("binder: pid %d (tid %d) trying to free an invalid buffer %p, bucket %d, sbuf %p\n",
+			proc->pid, thread->pid, uaddr, bucket, sbuf);
 		return -1;
 	}
 
@@ -1899,11 +1899,8 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 			break;
 
 		n = _bcmd_read_msg(q, &msg);
-		if (n < 0) {
-			if (n == -ERESTARTSYS)	// compat
-				n = -EINTR;
+		if (n < 0)
 			goto clean_up;
-		}
 
 		if (proc_looper) {
 			atomic_dec(&proc->proc_loopers);
@@ -2202,7 +2199,7 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (size < 512 * 1024)
 		proc->slob = fast_slob_create(size, 16 * 1024, 4, 2);
 	else
-		proc->slob = fast_slob_create(size, 64 * 1024, 3, 4);
+		proc->slob = fast_slob_create(size, 128 * 1024, 3, 4);
 	if (!proc->slob)
 		return -ENOMEM;
 
