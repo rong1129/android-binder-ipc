@@ -713,6 +713,8 @@ static void thread_queue_release(struct msg_queue *q, void *data)
 	struct binder_proc *proc = thread->proc;
 	struct bcmd_msg *msg, *next;
 
+	debugfs_remove(thread->info_node);
+
 	clear_msg_queue(proc, q);
 
 	list_for_each_entry_safe(msg, next, &thread->incoming_transactions, list) {
@@ -751,6 +753,8 @@ static void proc_queue_release(struct msg_queue *q, void *data)
 
 		_binder_free_obj(proc, obj);
 	}
+
+	debugfs_remove_recursive(proc->proc_dir);
 
 	// safe to do garbage collection now
 	list_for_each_entry_safe(priv, next, &proc->garbage_list, list) {
@@ -899,7 +903,6 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc, struct 
 static int binder_free_thread(struct binder_proc *proc, struct binder_thread *thread)
 {
 	free_msg_queue(thread->queue);
-	debugfs_remove(thread->info_node);
 	return 0;
 }
 
@@ -908,14 +911,14 @@ static int binder_free_proc(struct binder_proc *proc)
 	struct rb_node *n;
 	struct binder_thread *thread;
 
-	free_msg_queue(proc->queue);
+	disable_msg_queue(proc->queue);
 
 	while ((n = rb_first(&proc->thread_tree))) {
 		thread = rb_entry(n, struct binder_thread, rb_node);
 		binder_free_thread(proc, thread);
 	}
 
-	debugfs_remove_recursive(proc->proc_dir);
+	free_msg_queue(proc->queue);
 	return 0;
 }
 
@@ -2067,7 +2070,6 @@ static int binder_release(struct inode *nodp, struct file *filp)
 		context_mgr_obj = NULL;
 
 	// TODO: make sure existing referencing context_mgr_obj is safe
-	// TODO: assume no more threads running
 
 	binder_free_proc(proc);
 	return 0;
