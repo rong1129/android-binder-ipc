@@ -730,8 +730,6 @@ static void thread_queue_release(struct msg_queue *q, void *data)
 	spin_unlock(&proc->lock);
 
 	kfree(thread);
-
-	// this has to be the last step as the last proc queue user will destroy the proc
 	put_msg_queue(proc->queue);
 }
 
@@ -1774,10 +1772,8 @@ static long bcmd_read_dead_reply(struct binder_proc *proc, struct binder_thread 
 	if (size < sizeof(cmd))
 		return -ENOSPC;
 
-	if (thread->pending_replies > 0) {
+	if (thread->pending_replies > 0)
 		thread->pending_replies--;
-		//TODO: wakeup
-	}
 
 	if (put_user(cmd, (uint32_t *)buf))
 		return -EFAULT;
@@ -2150,8 +2146,7 @@ static unsigned int binder_poll(struct file *filp, poll_table *p)
 	msg_queue_poll_wait_read(thread->queue, filp, p);
 
 	if (thread->last_error ||
-	    !msg_queue_empty(thread->queue) ||
-	    (thread->pending_replies < 1 && msg_queue_size(proc->queue) > 0))
+	    !msg_queue_empty(thread->queue) || (msg_queue_size(proc->queue) > 0))
 		return POLLIN | POLLRDNORM;
 
 	// TODO: consider POLLOUT case as write can block too (not compat)
@@ -2198,7 +2193,7 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (proc->ustart || proc->slob)	// TODO: free existing slob?
 		return -EBUSY;
 
-	/* compat: sericemanager has a map size of 128K and the rest uses (1024-2)k */
+	/* compat: sericemanager has a map size of 128K and the rest uses (1024-8)k */
 	if (size < 512 * 1024)
 		proc->slob = fast_slob_create(size, 16 * 1024, 4, 2);
 	else
