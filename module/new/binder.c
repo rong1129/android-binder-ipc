@@ -2097,12 +2097,13 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				return -EFAULT;
 
 			r = cmd_write_read(proc, thread, &bwr);
-			if (r < 0)
-				return r;
 
+			/* copy bwr back regardlessly in case we've done write but
+			   got interrupted in read */
 			if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
 				return -EFAULT;
-			return 0;
+
+			return (r < 0) ? r : 0;
 		}
 
 		case BINDER_THREAD_EXIT:
