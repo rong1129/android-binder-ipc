@@ -91,7 +91,6 @@ struct binder_thread {
 
 	int state;
 	int non_block;
-	unsigned int last_error;
 
 	int pending_replies;
 	struct list_head incoming_transactions;
@@ -833,7 +832,6 @@ static struct binder_thread *binder_new_thread(struct binder_proc *proc, struct 
 
 	new_thread->pid = pid;
 	new_thread->state = 0;
-	new_thread->last_error = 0;
 	new_thread->non_block = (filp->f_flags & O_NONBLOCK) ? 1 : 0;	// compat
 	new_thread->pending_replies = 0;
 	INIT_LIST_HEAD(&new_thread->incoming_transactions);
@@ -981,7 +979,6 @@ static inline int binder_release_obj(struct binder_proc *proc, struct binder_thr
 		}
 
 		// regardless it's an object or a reference, it should cease to exist now
-		// TODO: review the risk of deleting the object here
 		r = binder_free_obj(proc, obj, 0);
 		if (r < 0)
 			return r;
@@ -1210,7 +1207,6 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	struct bcmd_msg *msg;
 	msg_queue_id to_id;
 	void *binder, *cookie;
-	uint32_t err;
 
 	if (bcmd == BC_TRANSACTION) {
 		struct binder_obj *obj;
@@ -1220,20 +1216,17 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		else
 			obj = binder_find_obj_by_ref(proc, tdata->target.handle);
 
-		if (!obj) {
-			err = BR_FAILED_REPLY;
-			goto failed_obj;
-		}
+		if (!obj)
+			goto failed_reply;
 
 		msg = binder_alloc_msg(tdata->data_size, tdata->offsets_size);
-		if (!msg) {
-			err = BR_FAILED_REPLY;
-			goto failed_msg;
-		}
+		if (!msg)
+			goto failed_reply;
 
 		to_id = obj->owner;
 		if (!(tdata->flags & TF_ONE_WAY)) {
-			bcmd_fill_traces(proc, thread, msg);
+			if (bcmd_fill_traces(proc, thread, msg) < 0)
+				goto failed_msg;
 			bcmd_lookup_caller(proc, thread, &to_id);
 		}
 
@@ -1245,10 +1238,9 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		   to check its validity, in particular if there are more than one pending
 		   incoming transactions on the stack waiting to be replied. See comments
 		   in bcmd_read_transaction() */
-		if (list_empty(&thread->incoming_transactions)) {
-			err = BR_FAILED_REPLY;
-			goto failed_transaction;
-		}
+		if (list_empty(&thread->incoming_transactions))
+			goto failed_reply;
+
 		msg = list_first_entry(&thread->incoming_transactions, struct bcmd_msg, list);
 		list_del(&msg->list);
 
@@ -1256,10 +1248,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 		binder = cookie = NULL;		// compat
 
 		msg = binder_realloc_msg(msg, tdata->data_size, tdata->offsets_size);
-		if (!msg) {
-			err = BR_FAILED_REPLY;
-			goto failed_msg;
-		}
+		if (!msg)
+			goto failed_reply;
 	}
 
 	msg->type = bcmd;
@@ -1272,10 +1262,8 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	msg->reply_to = msg_queue_id(thread->queue);	// reply queue & indicating source
 
 	if (tdata->data_size > 0) {
-		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0) {
-			err = BR_FAILED_REPLY;
-			goto failed_load;
-		}
+		if (bcmd_write_msg_buf(proc, thread, msg->buf, tdata) < 0)
+			goto failed_msg;
 	}
 	DUMP_MSG(proc->pid, thread->pid, 1, msg);
 
@@ -1286,15 +1274,11 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 	   message (of 'msg') arrives earlier before COMPLETE is enqueued, in which case the framework
 	   will simply treat the reply message as the response and return immediately before draining
 	   COMPLETE. The COMPLETE message left behind will then mess up the next transaction. */
-	if (_binder_write_cmd(thread->queue, msg->binder, msg->cookie, BR_TRANSACTION_COMPLETE) < 0) {
-		err = BR_FAILED_REPLY;
+	if (_binder_write_cmd(thread->queue, binder, cookie, BR_TRANSACTION_COMPLETE) < 0)
 		goto failed_write;
-	}
 
-	if (bcmd_write_msg(to_id, msg) < 0) {
-		err = BR_FAILED_REPLY;
+	if (bcmd_write_msg(to_id, msg) < 0)
 		goto failed_write;
-	}
 
 	if (bcmd == BC_TRANSACTION && !(tdata->flags & TF_ONE_WAY))
 		thread->pending_replies++;
@@ -1302,13 +1286,10 @@ static int bcmd_write_transaction(struct binder_proc *proc, struct binder_thread
 
 failed_write:
 	clear_msg_buf(proc, msg);
-failed_load:
-	kfree(msg);
 failed_msg:
-failed_transaction:
-failed_obj:
-	thread->last_error = err;
-	return -1;
+	kfree(msg);
+failed_reply:
+	return _binder_write_cmd(thread->queue, NULL, NULL, BR_FAILED_REPLY);
 }
 
 static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread *thread, void *uaddr)
@@ -1317,8 +1298,11 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 	struct slob_buf *sbuf;
 	int bucket;
 
-	if (!proc->slob || !proc->ustart || (unsigned long)uaddr < proc->ustart)
-		return -1;
+	if (!proc->slob || !proc->ustart || (unsigned long)uaddr < proc->ustart) {
+		printk("binder: pid %d (tid %d) trying to free an invalid buffer %p, slob %p, ustart %lx\n",
+			proc->pid, thread->pid, uaddr, proc->slob, proc->ustart);
+		return -EINVAL;
+	}
 
 	off = (unsigned long)uaddr - proc->ustart - (unsigned long)(((struct slob_buf *)0)->data);
 	sbuf = (struct slob_buf *)(proc->slob->start + off);
@@ -1327,7 +1311,7 @@ static int bcmd_write_free_buffer(struct binder_proc *proc, struct binder_thread
 	if (bucket < 0 || (sbuf->uaddr_data != (unsigned long)uaddr)) {
 		printk("binder: pid %d (tid %d) trying to free an invalid buffer %p, bucket %d, sbuf %p\n",
 			proc->pid, thread->pid, uaddr, bucket, sbuf);
-		return -1;
+		return -EINVAL;
 	}
 
 	if (sbuf->offsets_size > 0) {
@@ -1371,35 +1355,29 @@ static int bcmd_write_acquire(struct binder_proc *proc, struct binder_thread *th
 		obj = binder_find_obj_by_ref(proc, ref);
 
 	if (!obj)
-		return -1;
+		return -EINVAL;
 
 	if (bcmd == BC_ACQUIRE)
 		r = binder_acquire_obj(proc, thread, obj);
 	else
 		r = binder_release_obj(proc, thread, obj);
 
-	if (r < 0)
-		return -1;
-	return 0;
+	return (r < 0) ? r : 0;
 }
 
 static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *thread, struct bcmd_notifier_data *notifier, uint32_t bcmd)
 {
 	struct binder_obj *obj;
 	struct bcmd_msg *msg;
-	uint32_t err;
+	int r;
 
 	obj = binder_find_obj_by_ref(proc, notifier->handle);
-	if (!obj) {
-		err = BR_FAILED_REPLY;
-		goto failed_obj;
-	}
+	if (!obj)
+		return -EINVAL;
 
 	msg = binder_alloc_msg(0, 0);
-	if (!msg) {
-		err = BR_FAILED_REPLY;
-		goto failed_msg;
-	}
+	if (!msg)
+		return -ENOMEM;
 
 	msg->type = bcmd;
 	msg->binder = obj->binder;
@@ -1408,29 +1386,20 @@ static int bcmd_write_notifier(struct binder_proc *proc, struct binder_thread *t
 	// dead_binder sent to the process queue, while clear_notifcation_done sent to the request thread
 	msg->reply_to = (bcmd == BC_REQUEST_DEATH_NOTIFICATION) ? msg_queue_id(proc->queue) : msg_queue_id(thread->queue);
 
-	if (bcmd_write_msg(obj->owner, msg) < 0) {
-		err = BR_FAILED_REPLY;
-		goto failed_write;
+	if ((r = bcmd_write_msg(obj->owner, msg)) < 0) {
+		kfree(msg);
+		return r;
 	}
 
 	return 0;
-
-failed_write:
-	kfree(msg);
-failed_msg:
-failed_obj:
-	thread->last_error = err;
-	return -1;
 }
 
 static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thread, uint32_t bcmd)
 {
-	uint32_t err = 0;
-
 	switch (bcmd) {
 		case BC_ENTER_LOOPER:
 			if (thread->state & BINDER_LOOPER_STATE_READY)
-				err = BR_FAILED_REPLY;
+				return -EINVAL;
 			else
 				thread->state |= BINDER_LOOPER_STATE_ENTERED;
 			break;
@@ -1439,12 +1408,12 @@ static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thr
 			if (thread->state & BINDER_LOOPER_STATE_ENTERED)
 				thread->state &= ~BINDER_LOOPER_STATE_READY;
 			else
-				err = BR_FAILED_REPLY;
+				return -EINVAL;
 			break;
 
 		case BC_REGISTER_LOOPER:
 			if (thread->state & BINDER_LOOPER_STATE_READY)
-				err = BR_FAILED_REPLY;
+				return -EINVAL;
 			else {
 				atomic_inc(&proc->registered_loopers);
 				atomic_dec(&proc->requested_loopers);
@@ -1452,14 +1421,9 @@ static int bcmd_write_looper(struct binder_proc *proc, struct binder_thread *thr
 			break;
 
 		default:
-			err = BR_FAILED_REPLY;
-			break;
+			return -EINVAL;
 	}
 
-	if (err) {
-		thread->last_error = err;
-		return -1;
-	}
 	return 0;
 }
 
@@ -1467,7 +1431,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 {
 	char __user *p = buf;
 	uint32_t bcmd;
-	int err = 0;
+	int r;
 
 	while ((p + sizeof(bcmd)) <= end) {
 		if (get_user(bcmd, (uint32_t *)p))
@@ -1490,7 +1454,12 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 						return -EINVAL;
 				}
 
-				err += bcmd_write_transaction(proc, thread, &tdata, bcmd);
+				r = bcmd_write_transaction(proc, thread, &tdata, bcmd);
+				if (r < 0) {
+					printk("binder: pid %d (tid %d) wrote transaction/reply failed: %d\n",
+						proc->pid, thread->pid, r);
+					return r;
+				}
 				break;
 			}
 
@@ -1501,7 +1470,16 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 					return -EFAULT;
 				p += sizeof(void *);
 
-				err += bcmd_write_free_buffer(proc, thread, buffer);
+				/* compat: there're transactions containing no data, e.g. PING_TRANSACTION, but the
+				   framework still sends us FREE_BUFFER command for them with a NULL buffer. */
+				if (buffer) {
+					r = bcmd_write_free_buffer(proc, thread, buffer);
+					if (r < 0) {
+						printk("binder: pid %d (tid %d) wrote free_buffer failed: %d\n",
+							proc->pid, thread->pid, r);
+						return r;
+					}
+				}
 				break;
 			}
 
@@ -1515,7 +1493,12 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 					return -EFAULT;
 				p += sizeof(void *);
 
-				err += bcmd_write_acquire(proc, thread, (unsigned long)handle, bcmd);
+				r = bcmd_write_acquire(proc, thread, (unsigned long)handle, bcmd);
+				if (r < 0) {
+					printk("binder: pid %d (tid %d) wrote acquire/release failed: %d\n",
+						proc->pid, thread->pid, r);
+					//return r;
+				}
 				break;
 			}
 
@@ -1527,14 +1510,24 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 					return -EFAULT;
 				p += sizeof(notifier);
 
-				err += bcmd_write_notifier(proc, thread, &notifier, bcmd);
+				r = bcmd_write_notifier(proc, thread, &notifier, bcmd);
+				if (r < 0) {
+					printk("binder: pid %d (tid %d) wrote notifier failed: %d\n",
+						proc->pid, thread->pid, r);
+					//return r;
+				}
 				break;
 			}
 
 			case BC_ENTER_LOOPER:
 			case BC_EXIT_LOOPER:
 			case BC_REGISTER_LOOPER:
-				err += bcmd_write_looper(proc, thread, bcmd);
+				r = bcmd_write_looper(proc, thread, bcmd);
+				if (r < 0) {
+					printk("binder: pid %d (tid %d) wrote looper failed: %d\n",
+						proc->pid, thread->pid, r);
+					return r;
+				}
 				break;
 
 			case BC_DEAD_BINDER_DONE:
@@ -1772,7 +1765,7 @@ static long bcmd_read_dead_reply(struct binder_proc *proc, struct binder_thread 
 	if (size < sizeof(cmd))
 		return -ENOSPC;
 
-	if (thread->pending_replies > 0)
+	if (cmd == BR_DEAD_REPLY && thread->pending_replies > 0)
 		thread->pending_replies--;
 
 	if (put_user(cmd, (uint32_t *)buf))
@@ -1866,18 +1859,6 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 	int proc_looper = 0, force_return = 0;
 	long n;
 
-#if 0
-	if (thread->last_error) {
-		if (size >= sizeof(uint32_t)) {
-			if (put_user(thread->last_error, (uint32_t *)p))
-				return -EFAULT;
-			thread->last_error = 0;
-			p += sizeof(uint32_t);
-		}
-		return p - buf;	// error returned immediately
-	}
-#endif
-
 	if (thread->state & BINDER_LOOPER_STATE_READY) {	// compat: only ready threads can request spawn
 		n = bcmd_spawn_on_busy(proc, thread, p, size);
 		if (n)	// spawn or error returned immediately
@@ -1941,6 +1922,7 @@ static long binder_thread_read(struct binder_proc *proc, struct binder_thread *t
 				break;
 
 			case BR_DEAD_REPLY:
+			case BR_FAILED_REPLY:
 				n = bcmd_read_dead_reply(proc, thread, &msg, p, size);
 				force_return = 1;
 				break;
@@ -2145,8 +2127,7 @@ static unsigned int binder_poll(struct file *filp, poll_table *p)
 	msg_queue_poll_wait_read(proc->queue, filp, p);
 	msg_queue_poll_wait_read(thread->queue, filp, p);
 
-	if (thread->last_error ||
-	    !msg_queue_empty(thread->queue) || (msg_queue_size(proc->queue) > 0))
+	if (!msg_queue_empty(thread->queue) || msg_queue_size(proc->queue) > 0)
 		return POLLIN | POLLRDNORM;
 
 	// TODO: consider POLLOUT case as write can block too (not compat)
@@ -2278,7 +2259,6 @@ seq_show:
 	seq_printf(seq, "qid: %ld\n", msg_queue_id(thread->queue));
 	seq_printf(seq, "state: %d\n", thread->state);
 	seq_printf(seq, "non_block: %d\n", thread->non_block);
-	seq_printf(seq, "last_error: %x\n", thread->last_error);
 	seq_printf(seq, "pending_replies: %d\n", thread->pending_replies);
 	//TODO: show incoming_transactions
 
