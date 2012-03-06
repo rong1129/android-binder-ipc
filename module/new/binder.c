@@ -76,11 +76,15 @@ struct binder_proc {
 
 	pid_t pid;
 
-	atomic_t proc_loopers, requested_loopers, registered_loopers;
+	atomic_t busy_threads, proc_loopers, requested_loopers, registered_loopers;
 	int max_threads;
 
-	struct dentry *proc_dir, *thread_dir, *obj_dir;
+	spinlock_t reclaim_lock;
+	struct list_head reclaim_list;	// deferred release list for objects
+
 	struct list_head garbage_list;	// garbage collected when proc is released
+
+	struct dentry *proc_dir, *thread_dir, *obj_dir;
 };
 
 struct binder_thread {
@@ -567,8 +571,33 @@ static inline int binder_inform_owner(struct binder_obj *obj, unsigned int cmd)
 	return binder_write_cmd(obj->owner, obj->binder, obj->cookie, cmd);
 }
 
+static inline void binder_reclaim_obj(struct binder_proc *proc, struct binder_obj *obj)
+{
+	if (atomic_read(&proc->busy_threads) <= 1)
+		kfree(obj);
+	else {
+		spin_lock(&proc->reclaim_lock);
+		list_add(&obj->notifiers, &proc->reclaim_list);	// reuse notifiers entry
+		spin_unlock(&proc->reclaim_lock);
+	}
+}
+
+static inline void binder_reclaim_objs(struct binder_proc *proc)
+{
+	struct binder_obj *obj, *next;
+
+	spin_lock(&proc->reclaim_lock);
+	list_for_each_entry_safe(obj, next, &proc->reclaim_list, notifiers) {
+		list_del(&obj->notifiers);
+		kfree(obj);
+	}
+	spin_unlock(&proc->reclaim_lock);
+}
+
 static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 {
+	int r = 0;
+
 	debugfs_remove(obj->info_node);
 
 	if (OBJ_IS_BINDER(obj)) {
@@ -581,8 +610,9 @@ static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 			if (!msg) {
 				msg = binder_alloc_msg(0, 0);
 				if (!msg) {
-					kfree(obj);
-					return -ENOMEM;
+					r = -ENOMEM;
+					kfree(notifier);
+					continue;
 				}
 			}
 
@@ -603,8 +633,8 @@ static int _binder_free_obj(struct binder_proc *proc, struct binder_obj *obj)
 			binder_inform_owner(obj, BC_RELEASE);
 	}
 
-	kfree(obj);
-	return 0;
+	binder_reclaim_obj(proc, obj);
+	return r;
 }
 
 static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj, int force)
@@ -618,7 +648,7 @@ static int binder_free_obj(struct binder_proc *proc, struct binder_obj *obj, int
 		return _binder_free_obj(proc, obj);
 
 	debugfs_remove(obj->info_node);
-	kfree(obj);
+	binder_reclaim_obj(proc, obj);
 	return 0;
 }
 
@@ -787,6 +817,7 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 	proc->pid = task_tgid_vnr(current);
 	proc->max_threads = 0;
 
+	atomic_set(&proc->busy_threads, 0);
 	atomic_set(&proc->proc_loopers, 0);
 	atomic_set(&proc->requested_loopers, 0);
 	atomic_set(&proc->registered_loopers, 0);
@@ -800,6 +831,9 @@ static struct binder_proc *binder_new_proc(struct file *filp)
 
 	spin_lock_init(&proc->obj_lock);
 	proc->obj_tree.rb_node = NULL;
+
+	spin_lock_init(&proc->reclaim_lock);
+	INIT_LIST_HEAD(&proc->reclaim_list);
 
 	INIT_LIST_HEAD(&proc->garbage_list);
 
@@ -1471,7 +1505,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				p += sizeof(void *);
 
 				/* compat: there're transactions containing no data, e.g. PING_TRANSACTION, but the
-				   framework still sends us FREE_BUFFER command for them with a NULL buffer. */
+				   framework still sends us FREE_BUFFER command for them (with a NULL buffer). */
 				if (buffer) {
 					r = bcmd_write_free_buffer(proc, thread, buffer);
 					if (r < 0) {
@@ -1497,7 +1531,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if (r < 0) {
 					printk("binder: pid %d (tid %d) wrote acquire/release failed: %d\n",
 						proc->pid, thread->pid, r);
-					//return r;
+					//return r;	// compat: don't return error if target no longer exists
 				}
 				break;
 			}
@@ -1514,7 +1548,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if (r < 0) {
 					printk("binder: pid %d (tid %d) wrote notifier failed: %d\n",
 						proc->pid, thread->pid, r);
-					//return r;
+					//return r;	// compat: don't return error if target no longer exists
 				}
 				break;
 			}
@@ -1534,7 +1568,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if ((p + sizeof(void *)) > end)
 					return -EFAULT;
 
-				// TODO: do something?
+				// compat: not used
 				p += sizeof(void *);
 				break;
 
@@ -1543,7 +1577,7 @@ static long binder_thread_write(struct binder_proc *proc, struct binder_thread *
 				if ((p + 2 * sizeof(void *)) > end)
 					return -EFAULT;
 
-				// TODO: do something?
+				// compat: not used
 				p += 2 * sizeof(void *);
 				break;
 
@@ -2074,10 +2108,16 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (copy_from_user(&bwr, ubuf, sizeof(bwr)))
 				return -EFAULT;
 
+			atomic_inc(&proc->busy_threads);
+
 			r = cmd_write_read(proc, thread, &bwr);
 
-			/* copy bwr back regardlessly in case we've done write but
-			   got interrupted in read */
+			/* no one is referencing any objects, so it's safe to do reclaiming now */ 
+			if (atomic_dec_return(&proc->busy_threads) && !list_empty(&proc->reclaim_list))
+				binder_reclaim_objs(proc);
+
+			/* copy bwr back regardlessly in case we've done write but got interrupted
+			   in read */
 			if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
 				return -EFAULT;
 
