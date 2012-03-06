@@ -2113,7 +2113,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			r = cmd_write_read(proc, thread, &bwr);
 
 			/* no one is referencing any objects, so it's safe to do reclaiming now */ 
-			if (atomic_dec_return(&proc->busy_threads) && !list_empty(&proc->reclaim_list))
+			if (!atomic_dec_return(&proc->busy_threads) && !list_empty(&proc->reclaim_list))
 				binder_reclaim_objs(proc);
 
 			/* copy bwr back regardlessly in case we've done write but got interrupted
