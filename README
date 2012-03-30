@@ -1,3 +1,12 @@
+30 Mar 2012
+No updates for quite a while now, been busy on an iPhone app and finding a full-time job :(
+
+Anyway, I've got my Galaxy Nexus for a few days now. I'm still trying to get the hang of it, once I have some feeling of its responsce time and latency, I'll load and test the new driver on it.
+
+
+
+
+
 29 Feb 2012
 Just fixed another issue that caused apps crashing on my U8150. It's caused by some not well-thought design details in the binder protocal and framework implementation, see the comments in the source code.
 
